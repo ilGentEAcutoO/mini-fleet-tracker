@@ -115,6 +115,24 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 		return nil, cleanup, fmt.Errorf("setup: auth usecase: %w", err)
 	}
 
+	// VehicleRepo doubles as the vehicleLookup PositionUsecase needs for
+	// the driver-ownership check — its Get method satisfies that contract
+	// directly, so we wire the same instance into both usecases.
+	vehicleRepo := d1repo.NewVehicleRepo(d1Client)
+	vehicleUC, err := usecase.NewVehicleUsecase(vehicleRepo, usecase.IDGeneratorFunc(uuid.NewString))
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("setup: vehicle usecase: %w", err)
+	}
+
+	// PositionUsecase uses NoopPublisher until TASK-014 wires the real
+	// Durable Object client. Positions are still durably persisted to D1;
+	// only the WS broadcast is deferred.
+	positionRepo := d1repo.NewPositionRepo(d1Client)
+	positionUC, err := usecase.NewPositionUsecase(positionRepo, vehicleRepo, usecase.NoopPublisher{})
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("setup: position usecase: %w", err)
+	}
+
 	// --- Rate-limit storage ---------------------------------------------
 	rlStorage, err := middleware.NewKVStorage(kvRatelimits)
 	if err != nil {
@@ -125,6 +143,16 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	authHandler, err := handler.NewAuthHandler(authUC, signer, handler.DefaultCookieAttrs(cfg.IsDevelopment()))
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("setup: auth handler: %w", err)
+	}
+
+	vehicleHandler, err := handler.NewVehicleHandler(vehicleUC)
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("setup: vehicle handler: %w", err)
+	}
+
+	positionHandler, err := handler.NewPositionHandler(positionUC)
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("setup: position handler: %w", err)
 	}
 
 	corsMiddleware, err := middleware.CORS(cfg.CORSOrigin)
@@ -169,6 +197,20 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	})
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("setup: healthz rate-limit: %w", err)
+	}
+
+	// Per-driver position write cap (60/min/driver per plan). Must run AFTER
+	// the auth middleware so the user ID is in c.Locals; NewPerUser falls
+	// back to per-IP if no user ID is present, which protects unauth paths
+	// but is not the intended use.
+	positionRL, err := middleware.NewPerUser(middleware.PerUserConfig{
+		Storage:   rlStorage,
+		KeyPrefix: "rl-position",
+		Bucket:    middleware.Bucket{Capacity: 60, RefillRate: 1.0},
+		TTL:       2 * time.Minute,
+	})
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("setup: position rate-limit: %w", err)
 	}
 
 	// --- Fiber app + middleware chain -----------------------------------
@@ -219,6 +261,21 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	csrfMW := middleware.NewCSRF()
 	auth.Get("/me", authMW, authHandler.Me)
 	auth.Post("/logout", authMW, csrfMW, authHandler.Logout)
+
+	// Vehicle CRUD — manager-only enforcement lives inside the handler so
+	// the route table here stays uniform: auth on every method, CSRF on
+	// every mutating method, role gate inside the handler.
+	vehicles := api.Group("/vehicles", authMW)
+	vehicles.Get("/", vehicleHandler.List)
+	vehicles.Get("/:id", vehicleHandler.Get)
+	vehicles.Post("/", csrfMW, vehicleHandler.Create)
+	vehicles.Patch("/:id", csrfMW, vehicleHandler.Update)
+	vehicles.Delete("/:id", csrfMW, vehicleHandler.Delete)
+
+	// Position writes — driver-only enforcement in the handler; per-user
+	// rate limit on top of the global umbrella. NoopPublisher is wired in
+	// the usecase; TASK-014 swaps in the real Durable Object client.
+	api.Post("/positions", authMW, csrfMW, positionRL, positionHandler.Write)
 
 	return app, cleanup, nil
 }
