@@ -1,0 +1,36 @@
+# fleet-worker-gateway — the public edge router.
+#
+# Fronts fleet-tracker.jairuchan.com. Forwards /api/* to the Go API,
+# upgrades /ws/* to the FleetHub Durable Object, and HMAC-verifies
+# /internal/publish before relaying it to the DO.
+name = "fleet-worker-gateway"
+main = "src/index.ts"
+compatibility_date = "2026-05-19"
+compatibility_flags = ["nodejs_compat"]
+
+# The gateway holds a binding to the DO declared in fleet-hub/wrangler.toml.
+# `script_name` is required because the class is defined in a different
+# worker (cross-script binding). The class_name must match exactly.
+[[durable_objects.bindings]]
+name = "FLEET_HUB"
+class_name = "FleetHub"
+script_name = "fleet-do-hub"
+
+# Production routes are configured in TASK-024 (deploy phase).
+# routes = [
+#   { pattern = "fleet-tracker.jairuchan.com/api/*", zone_name = "jairuchan.com" },
+#   { pattern = "fleet-tracker.jairuchan.com/ws/*",  zone_name = "jairuchan.com" },
+# ]
+
+[vars]
+# Dev: forward /api/* to the local Go API.
+# Prod (TASK-025): replaced with a Container service binding; this var
+# becomes unused but is left declared so dev still works.
+API_UPSTREAM_URL = "http://localhost:8080"
+ALLOWED_ORIGINS = "http://localhost:3000,https://fleet-tracker.jairuchan.com"
+
+# Secrets: JWT_SECRET, INTERNAL_PUBLISH_SECRET
+# Loaded from .dev.vars locally; `wrangler secret put` in prod.
+
+# [observability]
+# enabled = true
