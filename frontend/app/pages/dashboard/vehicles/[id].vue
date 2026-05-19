@@ -232,11 +232,33 @@ const center = computed(() => {
       </CardContent>
     </Card>
 
-    <MapView
-      :positions="emptyMarkers"
-      :path="positions"
-      :center="center"
-      class-name="h-[560px] w-full rounded-md border border-border"
-    />
+    <!-- Replay timeline (TASK-021) wraps the same MapView so the polyline
+         stays put while the scrub head's interpolated position appears as
+         a moving marker on top. When the user is not playing, `position`
+         is null and the marker layer falls back to empty. -->
+    <ReplayTimeline :positions="positions">
+      <template #default="{ position }">
+        <MapView
+          :positions="position ? new Map([[vehicleId, position]]) : emptyMarkers"
+          :path="positions"
+          :center="center"
+          class-name="h-[560px] w-full rounded-md border border-border mt-3"
+        />
+      </template>
+    </ReplayTimeline>
+
+    <!-- Geofence editor (TASK-020): set or update the circular boundary;
+         transition crossings on subsequent position writes fire a live
+         geofence.alert that the GeofenceAlertBanner toasts. -->
+    <GeofenceEditor :vehicle-id="vehicleId" />
+
+    <!-- Photo upload (TASK-022): manager-only; per-vehicle daily quota of 3,
+         5MB cap per file, presigned PUT directly to R2. Component renders
+         a 404-empty state in dev when the routes are not wired. -->
+    <PhotoUpload :vehicle-id="vehicleId" />
+
+    <!-- Headless alert toaster: subscribes to useFleetStore().alerts and
+         fires a Sonner toast per unique entry. Renders no visible DOM. -->
+    <GeofenceAlertBanner />
   </section>
 </template>

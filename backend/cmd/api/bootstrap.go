@@ -73,20 +73,47 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 		return nil, cleanup, fmt.Errorf("setup: kv ratelimits: %w", err)
 	}
 
-	// kvQuotas is not used by the auth layer but the wiring asks the
-	// operator to provide it. Wire it now to fail fast if the namespace
-	// is missing; later tasks (R2 photo quota) will consume it.
-	_, err = cfclient.NewKVClient(cfclient.KVConfig{
+	// kvQuotas backs the per-vehicle-per-day R2 photo-upload quota (TASK-022).
+	// Real client in prod; nil-able fallback in dev so `go run ./cmd/api`
+	// keeps booting without a real KV namespace. PhotoHandler is only wired
+	// when kvQuotas AND r2Client are both real — the photo route table is
+	// dropped entirely in dev rather than silently misbehaving.
+	var kvQuotas *cfclient.KVClient
+	kvQuotas, err = cfclient.NewKVClient(cfclient.KVConfig{
 		AccountID:   cfg.CFAccountID,
 		NamespaceID: cfg.KVQuotasNamespaceID,
 		APIToken:    cfg.CFAPIToken,
 	})
 	if err != nil {
-		// Dev environments can have empty KV namespace IDs — only fail in prod.
 		if !cfg.IsDevelopment() {
 			return nil, cleanup, fmt.Errorf("setup: kv quotas: %w", err)
 		}
-		log.Warn().Err(err).Msg("kv quotas client not constructed; quotas features disabled in dev")
+		log.Warn().Err(err).Msg("kv quotas client not constructed; photo upload disabled in dev")
+		kvQuotas = nil
+	}
+
+	// R2 client for the photo presigner. Same dev-vs-prod posture as
+	// kvQuotas above: required in prod, optional in dev.
+	var r2Client *cfclient.R2Client
+	if cfg.R2Endpoint != "" {
+		r2Client, err = cfclient.NewR2Client(context.Background(), cfclient.R2Config{
+			Endpoint:        cfg.R2Endpoint,
+			AccessKeyID:     cfg.R2AccessKeyID,
+			SecretAccessKey: cfg.R2SecretAccessKey,
+			Region:          "auto",
+			BucketName:      cfg.R2BucketName,
+		})
+		if err != nil {
+			if !cfg.IsDevelopment() {
+				return nil, cleanup, fmt.Errorf("setup: r2 client: %w", err)
+			}
+			log.Warn().Err(err).Msg("R2 client not constructed; photo upload disabled in dev")
+			r2Client = nil
+		}
+	} else if !cfg.IsDevelopment() {
+		return nil, cleanup, errors.New("setup: R2_ENDPOINT is required in production")
+	} else {
+		log.Warn().Msg("R2_ENDPOINT not set; photo upload disabled in dev")
 	}
 
 	// --- Migrations -----------------------------------------------------
@@ -125,9 +152,17 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	// history endpoint. The same *d1repo.PositionRepo instance satisfies
 	// both the PositionUsecase's writer and the VehicleUsecase's lister.
 	positionRepo := d1repo.NewPositionRepo(d1Client)
+	// GeofenceRepo: storage for the per-vehicle circular fence. Also wired
+	// into PositionUsecase via WithGeofences so each position write does
+	// the transition-detection step + emits a geofence.alert on crossings.
+	geofenceRepo := d1repo.NewGeofenceRepo(d1Client)
 	vehicleUC, err := usecase.NewVehicleUsecase(vehicleRepo, positionRepo, usecase.IDGeneratorFunc(uuid.NewString))
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("setup: vehicle usecase: %w", err)
+	}
+	geofenceUC, err := usecase.NewGeofenceUsecase(geofenceRepo, vehicleRepo, usecase.IDGeneratorFunc(uuid.NewString))
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("setup: geofence usecase: %w", err)
 	}
 
 	// PositionUsecase needs an EventPublisher to broadcast position.update
@@ -161,7 +196,10 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 		positionEventPublisher = fleetPub
 	}
 
-	positionUC, err := usecase.NewPositionUsecase(positionRepo, vehicleRepo, positionEventPublisher)
+	positionUC, err := usecase.NewPositionUsecase(
+		positionRepo, vehicleRepo, positionEventPublisher,
+		usecase.WithGeofences(geofenceRepo),
+	)
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("setup: position usecase: %w", err)
 	}
@@ -186,6 +224,28 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	positionHandler, err := handler.NewPositionHandler(positionUC)
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("setup: position handler: %w", err)
+	}
+
+	geofenceHandler, err := handler.NewGeofenceHandler(geofenceUC)
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("setup: geofence handler: %w", err)
+	}
+
+	// Photo handler is optional: only constructed when both R2 and the
+	// quota KV namespace are real. In dev with neither set, the photo
+	// routes are simply not registered (the frontend handles 404 + empty
+	// gracefully via the PhotoUpload component's error path).
+	var photoHandler *handler.PhotoHandler
+	if r2Client != nil && kvQuotas != nil {
+		var photoUC *usecase.PhotoUsecase
+		photoUC, err = usecase.NewPhotoUsecase(r2Client, kvQuotas, vehicleRepo, usecase.IDGeneratorFunc(uuid.NewString))
+		if err != nil {
+			return nil, cleanup, fmt.Errorf("setup: photo usecase: %w", err)
+		}
+		photoHandler, err = handler.NewPhotoHandler(photoUC)
+		if err != nil {
+			return nil, cleanup, fmt.Errorf("setup: photo handler: %w", err)
+		}
 	}
 
 	// Healthz checks D1 + KV liveness on every call. We pass kvSessions
@@ -321,8 +381,27 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	// Position writes — driver-only enforcement in the handler; per-user
 	// rate limit on top of the global umbrella. The position usecase
 	// publishes a position.update event to the FleetHub DO after a
-	// successful save (best-effort; D1 is the source of truth).
+	// successful save (best-effort; D1 is the source of truth) and also
+	// runs geofence transition-detection (TASK-020) when WithGeofences
+	// is wired above.
 	api.Post("/positions", authMW, csrfMW, positionRL, positionHandler.Write)
+
+	// Geofence CRUD (TASK-020): manager-only enforcement inside the handler.
+	// GET is read-only so no CSRF; PUT mutates so the CSRF middleware applies.
+	vehicles.Get("/:id/geofence", geofenceHandler.Get)
+	vehicles.Put("/:id/geofence", csrfMW, geofenceHandler.Put)
+
+	// Photo upload (TASK-022): only when R2 + quota KV are both wired. In
+	// dev without those, the routes are absent and the frontend's
+	// PhotoUpload component will surface a friendly 404 path. The presign
+	// route uses Fiber's `:photos:presign` syntax — the second colon is
+	// part of the literal segment, not a second path param.
+	if photoHandler != nil {
+		vehicles.Post("/:id/photos\\:presign", csrfMW, photoHandler.Presign)
+		vehicles.Get("/:id/photos", photoHandler.List)
+	} else {
+		log.Info().Msg("photo routes not registered (R2 or KV quotas client missing)")
+	}
 
 	return app, cleanup, nil
 }
