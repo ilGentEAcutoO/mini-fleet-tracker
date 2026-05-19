@@ -1,0 +1,10 @@
+# Build output (produced by `make build`)
+bin/
+
+# Go test/coverage artifacts
+coverage.out
+coverage.txt
+
+# Local env files (root .gitignore already covers .env, repeated here for clarity)
+.env
+.env.local

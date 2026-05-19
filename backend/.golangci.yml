@@ -1,0 +1,47 @@
+# golangci-lint v2 configuration for the Mini Fleet Tracker backend.
+# Tuned to be sensible-not-aggressive so make lint passes on day 1.
+# See https://golangci-lint.run/usage/configuration/ for reference.
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+  settings:
+    errcheck:
+      # These calls are commonly used without checking the error and adding a
+      # check is more noise than signal.
+      exclude-functions:
+        - fmt.Print
+        - fmt.Printf
+        - fmt.Println
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (*github.com/gofiber/fiber/v2.App).Shutdown
+        - (*github.com/gofiber/fiber/v2.App).ShutdownWithContext
+
+    govet:
+      enable:
+        - shadow
+
+  exclusions:
+    rules:
+      # Test files often shadow err intentionally and ignore close errors.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
