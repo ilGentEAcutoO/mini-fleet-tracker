@@ -1,0 +1,10 @@
+.nuxt
+.output
+.data
+.cache
+.wrangler
+dist
+node_modules
+public
+*.lock
+pnpm-lock.yaml
