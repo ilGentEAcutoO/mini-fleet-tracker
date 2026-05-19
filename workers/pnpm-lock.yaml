@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@cloudflare/containers':
+        specifier: ^0.3.4
+        version: 0.3.4
       '@tsndr/cloudflare-worker-jwt':
         specifier: ^3.2.0
         version: 3.2.1
@@ -32,6 +35,9 @@ importers:
         version: 4.92.0(@cloudflare/workers-types@4.20260519.1)
 
 packages:
+
+  '@cloudflare/containers@0.3.4':
+    resolution: {integrity: sha512-6kWodmgBSug/rr9fjcWrZcKhxmWTEc1BTKC6nVv7yvYaRRvV3rZPZjq9R17eN0l9cl2LNc03wp/Z6OV+0uDwXA==}
 
   '@cloudflare/kv-asset-handler@0.5.0':
     resolution: {integrity: sha512-jxQYkj8dSIzc0cD6cMMNdOc1UVjqSqu8BZdor5s8cGjW2I8BjODt/kWPVdY+u9zj3ms75Q5qaZgnxUad83+eAg==}
@@ -923,6 +929,8 @@ packages:
     resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
 
 snapshots:
+
+  '@cloudflare/containers@0.3.4': {}
 
   '@cloudflare/kv-asset-handler@0.5.0': {}
 

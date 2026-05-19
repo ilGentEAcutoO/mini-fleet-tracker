@@ -1,0 +1,50 @@
+# fleet-api — the Container Worker that wraps the Go Fiber backend.
+#
+# Pattern: a small TypeScript Worker exports a class extending
+# @cloudflare/containers.Container; wrangler builds the image from the
+# backend/Dockerfile and pushes to the CF managed registry on `wrangler
+# deploy`. The gateway Worker forwards /api/* and /ws/* (post-DO upgrade
+# misses) here via a service binding instead of HTTP fetch.
+#
+# Cost: max_instances=1 + sleepAfter on the class means the container
+# hibernates between requests. Total spend stays bounded by the
+# hard-expiration on 2026-05-31 (see TASK-030).
+name = "fleet-api"
+main = "src/index.ts"
+compatibility_date = "2026-05-19"
+compatibility_flags = ["nodejs_compat"]
+
+[[containers]]
+class_name = "FleetAPI"
+image = "../../backend/Dockerfile"
+max_instances = 1
+
+[[durable_objects.bindings]]
+name = "FLEET_API"
+class_name = "FleetAPI"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FleetAPI"]
+
+# Non-sensitive env vars exposed to the container via the Container
+# class's envVars field (see src/index.ts). Sensitive values arrive via
+# `wrangler secret put` — they reach the container through the same
+# bridge but are never echoed in deploys / logs.
+[vars]
+APP_ENV = "production"
+PORT = "8080"
+LOG_LEVEL = "info"
+CORS_ORIGIN = "https://fleet-tracker.jairukchan.com"
+CF_ACCOUNT_ID = "a24ce30584273b42333051f1cdec48e2"
+D1_DATABASE_ID = "02695fdd-1c5c-4850-b519-2ec5fc46f077"
+KV_SESSIONS_NAMESPACE_ID = "b57b99fc9d164f029c654474b960af05"
+KV_RATELIMITS_NAMESPACE_ID = "024a6465e8a04470817f223563fa3911"
+KV_QUOTAS_NAMESPACE_ID = "4845fc58ecf44f83a4256a48dda298ea"
+R2_ENDPOINT = "https://a24ce30584273b42333051f1cdec48e2.r2.cloudflarestorage.com"
+R2_BUCKET_NAME = "fleet-r2-vehicle-photos"
+DO_PUBLISH_URL = "https://fleet-tracker.jairukchan.com/internal/publish"
+
+# Secrets set via `wrangler secret put` (do NOT add here):
+#   JWT_SECRET, INTERNAL_PUBLISH_SECRET, CF_API_TOKEN,
+#   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
