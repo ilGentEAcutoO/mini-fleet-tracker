@@ -1,0 +1,40 @@
+# fleet-do-hub — the WebSocket fan-out Durable Object.
+#
+# This worker exports a single Durable Object class (FleetHub). The class
+# is the only export the deployment registers; the worker's default fetch
+# handler simply forwards to the DO so the script is independently
+# deployable for migrations and tooling.
+name = "fleet-do-hub"
+main = "src/fleet-hub.ts"
+compatibility_date = "2026-05-19"
+# nodejs_compat is enabled so any future JWT/crypto helper that pulls a
+# Node-shim subset works; the current code uses Web Crypto + the
+# @tsndr/cloudflare-worker-jwt package, both Workers-native.
+compatibility_flags = ["nodejs_compat"]
+
+# The DO is referenced from BOTH workers (gateway routes /ws and /internal
+# traffic to it). The binding is declared here too so the worker can
+# self-reference for end-to-end tests in vitest-pool-workers.
+[[durable_objects.bindings]]
+name = "FLEET_HUB"
+class_name = "FleetHub"
+# script_name is omitted: a DO worker that defines the class binds to its
+# own script implicitly. The gateway's wrangler.toml uses script_name to
+# point at "fleet-do-hub".
+
+# First-time migration — registers the class. There is no rename or
+# delete because this is the initial deployment.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FleetHub"]
+
+# Public-facing vars. Secrets (JWT_SECRET, INTERNAL_PUBLISH_SECRET) are
+# loaded from .dev.vars locally and via `wrangler secret put` in prod.
+[vars]
+# Comma-separated list of allowed Origin values for the WS upgrade.
+# TASK-024 will trim this to just the prod origin.
+ALLOWED_ORIGINS = "http://localhost:3000,https://fleet-tracker.jairuchan.com"
+
+# Observability hooks deferred to TASK-024; left commented for clarity:
+# [observability]
+# enabled = true

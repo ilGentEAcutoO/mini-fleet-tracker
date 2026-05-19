@@ -1,0 +1,27 @@
+{
+  "name": "fleet-workers",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Cloudflare Workers for Mini Fleet Tracker: edge API gateway + FleetHub Durable Object (WebSocket Hibernation hub).",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev:gateway": "wrangler dev --config gateway/wrangler.toml",
+    "dev:hub": "wrangler dev --config fleet-hub/wrangler.toml",
+    "deploy:gateway": "wrangler deploy --config gateway/wrangler.toml",
+    "deploy:hub": "wrangler deploy --config fleet-hub/wrangler.toml"
+  },
+  "dependencies": {
+    "@tsndr/cloudflare-worker-jwt": "^3.2.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.6",
+    "@cloudflare/workers-types": "^4.20251119.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.92.0"
+  }
+}

@@ -1,0 +1,17 @@
+# pnpm / npm
+node_modules/
+
+# Cloudflare Wrangler state + local dev secrets
+.wrangler/
+.dev.vars
+
+# Test / coverage output
+coverage/
+.vitest/
+*.log
+
+# Build artifacts (Workers are bundled by wrangler; nothing here to commit)
+dist/
+
+# Editor / OS
+.DS_Store
