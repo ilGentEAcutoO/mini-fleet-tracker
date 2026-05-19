@@ -47,6 +47,10 @@ export interface Env {
   API_UPSTREAM_URL: string
   ALLOWED_ORIGINS: string
   FLEET_HUB: DurableObjectNamespace
+  // Service binding to the fleet-api Container Worker. Optional so the
+  // dev path still type-checks when the binding is absent (wrangler dev
+  // without --services); production always has it.
+  FLEET_API?: Fetcher
 }
 
 // Hop-by-hop headers (RFC 7230 §6.1) must not be forwarded — many of them
@@ -248,32 +252,35 @@ async function upgradeToHub(req: Request, env: Env): Promise<Response> {
 // The shape (same request method, same body, filtered headers) is kept
 // identical so the swap is mechanical.
 async function forwardToUpstream(req: Request, env: Env): Promise<Response> {
-  // TODO(TASK-025): replace with env.CONTAINER.fetch(req) once the
-  // service binding is wired.
-  const upstream = new URL(env.API_UPSTREAM_URL)
-  const incoming = new URL(req.url)
-  upstream.pathname = incoming.pathname
-  upstream.search = incoming.search
-
+  // Filter hop-by-hop headers before forwarding either via service
+  // binding or HTTP fallback. Both paths preserve method + body + path.
   const forwardedHeaders = new Headers()
   for (const [key, value] of req.headers) {
     if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue
     forwardedHeaders.set(key, value)
   }
-  // Cloudflare strips Host and other hop-by-hop headers on its own, but
-  // preserving them explicitly is a behaviour guarantee against future
-  // runtime tweaks.
 
   const init: RequestInit = {
     method: req.method,
     headers: forwardedHeaders,
     redirect: 'manual',
   }
-  // Methods that may have a body — null body for GET/HEAD/OPTIONS keeps
-  // fetch() from complaining.
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
     init.body = req.body
   }
+
+  // Service-binding path: production. env.FLEET_API.fetch goes
+  // intra-Cloudflare without DNS or loop-detection issues that hit
+  // worker → workers.dev fetches in the same account.
+  if (env.FLEET_API) {
+    return env.FLEET_API.fetch(new Request(req.url, init))
+  }
+
+  // HTTP fallback: dev only. Honour API_UPSTREAM_URL.
+  const upstream = new URL(env.API_UPSTREAM_URL)
+  const incoming = new URL(req.url)
+  upstream.pathname = incoming.pathname
+  upstream.search = incoming.search
   return fetch(upstream.toString(), init)
 }
 

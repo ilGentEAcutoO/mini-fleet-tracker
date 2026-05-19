@@ -22,12 +22,20 @@ script_name = "fleet-do-hub"
 #   { pattern = "fleet-tracker.jairukchan.com/ws/*",  zone_name = "jairukchan.com" },
 # ]
 
+# Service binding to the fleet-api Container Worker — intra-CF, no DNS
+# hop, no loop-detection 404 that workers.dev URLs get when fetched from
+# another worker in the same account. Replaces the previous HTTPS fetch
+# to env.API_UPSTREAM_URL.
+[[services]]
+binding = "FLEET_API"
+service = "fleet-api"
+
 [vars]
-# Dev: forward /api/* to the local Go API.
-# Prod (TASK-025): replaced with a Container service binding; this var
-# becomes unused but is left declared so dev still works.
+# Kept as a dev fallback only. Production traffic always goes through
+# env.FLEET_API service binding above; this var is read only when the
+# binding is unavailable (local `wrangler dev` without --services).
 API_UPSTREAM_URL = "http://localhost:8080"
-ALLOWED_ORIGINS = "http://localhost:3000,https://fleet-tracker.jairukchan.com"
+ALLOWED_ORIGINS = "http://localhost:3000,https://fleet-tracker.jairukchan.com,https://fleet-worker-gateway.sornwin.workers.dev"
 
 # Secrets: JWT_SECRET, INTERNAL_PUBLISH_SECRET
 # Loaded from .dev.vars locally; `wrangler secret put` in prod.
