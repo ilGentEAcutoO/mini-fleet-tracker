@@ -184,6 +184,18 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 		return nil, cleanup, fmt.Errorf("setup: position handler: %w", err)
 	}
 
+	// Healthz checks D1 + KV liveness on every call. We pass kvSessions
+	// (not kvQuotas, which is nil-in-dev) because the sessions namespace
+	// is always constructed above — choosing the always-built dep keeps
+	// the handler usable in every environment without a nil-guard. The
+	// dep pings live behind a 2s timeout; failures mark the per-dep
+	// status as "fail" but the HTTP response is always 200 so operators
+	// can read the granular signal.
+	healthzHandler, err := handler.NewHealthzHandler(d1Client, kvSessions, gitCommit, DemoExpiresAt)
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("setup: healthz handler: %w", err)
+	}
+
 	corsMiddleware, err := middleware.CORS(cfg.CORSOrigin)
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("setup: cors: %w", err)
@@ -266,14 +278,10 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	app.Use(globalRL)
 
 	// --- Routes ---------------------------------------------------------
-	// /healthz: no auth, no CSRF, but tight per-IP cap.
-	app.Get("/healthz", healthzRL, func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status":          "ok",
-			"commit":          gitCommit,
-			"demo_expires_at": DemoExpiresAt,
-		})
-	})
+	// /healthz: no auth, no CSRF, but tight per-IP cap. The handler
+	// pings D1 + KV under a 2s timeout and reports per-dep status
+	// alongside the build commit and demo expiry.
+	app.Get("/healthz", healthzRL, healthzHandler.Check)
 
 	api := app.Group("/api")
 	auth := api.Group("/auth")
