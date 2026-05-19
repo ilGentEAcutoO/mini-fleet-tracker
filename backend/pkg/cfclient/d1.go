@@ -233,6 +233,109 @@ func (c *D1Client) QueryRow(ctx context.Context, sqlText string, args ...any) d1
 	}
 }
 
+// Query runs a statement that may return multiple rows. D1's /query endpoint
+// already materialises all results in one HTTP response, so the returned
+// Rows implementation walks a cached slice — Next is O(1), Close is a no-op
+// beyond marking the cursor exhausted. There is no streaming layer.
+//
+// Errors from doQuery are returned directly (rather than deferred to the
+// first Next call) so callers can distinguish "no rows yet" from
+// "transport failed" without a Scan ceremony.
+func (c *D1Client) Query(ctx context.Context, sqlText string, args ...any) (d1pkg.Rows, error) {
+	env, err := c.doQuery(ctx, "Query", sqlText, args)
+	if err != nil {
+		return nil, err
+	}
+	if len(env.Result) == 0 {
+		// A successful envelope with no result set is degenerate but valid;
+		// return an iterator that yields zero rows.
+		return &d1Rows{}, nil
+	}
+	rs := env.Result[0].Results
+	// Snapshot the column order from the first row if any. An empty result
+	// set has no column metadata in D1's envelope, but that is fine — Scan
+	// is never called on a zero-row iterator.
+	var columns []string
+	if len(rs) > 0 {
+		columns = collectColumnOrder(rs[0])
+	}
+	return &d1Rows{rows: rs, columns: columns}, nil
+}
+
+// d1Rows is the multi-row counterpart of d1Row. It walks a slice of
+// JSON-decoded row maps with an internal cursor; Scan reuses the same
+// assignD1Value path as d1Row so the supported destination types stay
+// in lockstep.
+//
+// The zero cursor index is the "before-first-row" position — Next must
+// be called once before the first Scan, matching database/sql.Rows
+// semantics.
+type d1Rows struct {
+	rows    []map[string]any
+	columns []string
+	idx     int // 1-based after the first Next; 0 means before-first
+	err     error
+	closed  bool
+}
+
+// Next advances the cursor. Returns false when iteration is past the last
+// row or after Close. A deferred error from a previous Scan does not
+// terminate iteration on its own — callers should check Err() to detect it.
+func (r *d1Rows) Next() bool {
+	if r.closed {
+		return false
+	}
+	if r.idx >= len(r.rows) {
+		return false
+	}
+	r.idx++
+	return true
+}
+
+// Scan binds dest pointers to the current row. Callers must have called
+// Next at least once. Mirrors d1Row.Scan in implementation so the supported
+// destination type set is identical.
+func (r *d1Rows) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	if r.idx == 0 {
+		return errors.New("d1 Rows: Scan called before Next")
+	}
+	if r.idx > len(r.rows) {
+		return errors.New("d1 Rows: Scan called past end of rows")
+	}
+	row := r.rows[r.idx-1]
+	if len(dest) > len(r.columns) {
+		return fmt.Errorf("d1 Rows Scan: %d dest values but row has %d columns",
+			len(dest), len(r.columns))
+	}
+	for i, d := range dest {
+		col := r.columns[i]
+		val, ok := row[col]
+		if !ok {
+			return fmt.Errorf("d1 Rows Scan: column %q missing from row", col)
+		}
+		if err := assignD1Value(d, val); err != nil {
+			return fmt.Errorf("d1 Rows Scan: column %q: %w", col, err)
+		}
+	}
+	return nil
+}
+
+// Err returns any deferred iteration error. The D1 client materialises the
+// full result set up-front, so there is no streaming error path — Err is
+// nil unless a previous Scan stored a sticky error.
+func (r *d1Rows) Err() error { return r.err }
+
+// Close marks the iterator exhausted. The slice-backed implementation
+// holds no transport resources, so Close is effectively a flag flip and
+// is safe to call multiple times.
+func (r *d1Rows) Close() error {
+	r.closed = true
+	return nil
+}
+
 // errNoRows carries the magic substring that repository/d1.isNoRowsErr
 // matches on. We deliberately mirror database/sql's message so the
 // migrator and the in-memory test executor see the same shape.

@@ -33,14 +33,48 @@ const upSuffix = ".up.sql"
 // the in-process sqlite3 driver does not split statements automatically,
 // so the test executor uses splitStatements() defined in this file. The
 // D1 HTTP /query endpoint accepts multi-statement bodies natively.
+//
+// Query was added in TASK-010 to support repositories that need to scan
+// multiple rows (e.g. VehicleRepo.List). The narrow contract is identical
+// across backends: callers consume the iterator with Next + Scan, must
+// honour the deferred error from Err, and must Close exactly once.
 type Executor interface {
 	Exec(ctx context.Context, sql string, args ...any) error
 	QueryRow(ctx context.Context, sql string, args ...any) Row
+	Query(ctx context.Context, sql string, args ...any) (Rows, error)
 }
 
 // Row is the minimal interface for reading a single result row.
 type Row interface {
 	Scan(dest ...any) error
+}
+
+// Rows is the minimal interface for iterating a multi-row result set. The
+// contract mirrors database/sql.Rows in shape so implementations can wrap
+// either an *sql.Rows (the sqlite test executor) or an already-materialised
+// slice of maps (the D1 HTTP client) without introducing a different
+// idiom in caller code.
+//
+// Usage:
+//
+//	rows, err := exec.Query(ctx, "SELECT ... FROM t")
+//	if err != nil { return err }
+//	defer rows.Close()
+//	for rows.Next() {
+//	    if err := rows.Scan(&a, &b); err != nil { return err }
+//	    // ... append to result ...
+//	}
+//	if err := rows.Err(); err != nil { return err }
+type Rows interface {
+	// Next advances to the next row. Returns false when no more rows are
+	// available or when iteration encountered an error (check Err()).
+	Next() bool
+	// Scan binds destination pointers to the current row's columns.
+	Scan(dest ...any) error
+	// Err returns any deferred error from Next; nil on clean termination.
+	Err() error
+	// Close releases backend resources. Safe to call multiple times.
+	Close() error
 }
 
 // Migrator applies pending SQL migrations from an embedded filesystem.

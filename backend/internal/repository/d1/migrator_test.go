@@ -48,6 +48,29 @@ func (s *sqliteExecutor) QueryRow(ctx context.Context, query string, args ...any
 	return s.db.QueryRowContext(ctx, query, args...)
 }
 
+// Query satisfies the Executor.Query method added in TASK-010. The test
+// double wraps the *sql.Rows returned by database/sql so callers see the
+// same Rows contract that the production D1 client materialises from JSON.
+func (s *sqliteExecutor) Query(ctx context.Context, query string, args ...any) (Rows, error) {
+	r, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &sqliteRows{rows: r}, nil
+}
+
+// sqliteRows adapts *sql.Rows to the package's Rows interface. The four
+// methods forward verbatim — the only reason for the wrapper is to keep
+// the concrete database/sql type from leaking through the interface.
+type sqliteRows struct {
+	rows *sql.Rows
+}
+
+func (r *sqliteRows) Next() bool                  { return r.rows.Next() }
+func (r *sqliteRows) Scan(dest ...any) error      { return r.rows.Scan(dest...) }
+func (r *sqliteRows) Err() error                  { return r.rows.Err() }
+func (r *sqliteRows) Close() error                { return r.rows.Close() }
+
 // newSQLiteExecutor opens a fresh in-memory SQLite database and enables
 // foreign-key enforcement so the migrator's REFERENCES clauses are honored.
 // The "?_pragma=foreign_keys(1)" DSN switch is specific to modernc.org/sqlite.

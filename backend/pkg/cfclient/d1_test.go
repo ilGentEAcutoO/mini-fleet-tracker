@@ -327,6 +327,122 @@ func TestD1_QueryRow_PropagatesQueryError(t *testing.T) {
 	}
 }
 
+func TestD1_Query_IteratesMultipleRows(t *testing.T) {
+	c, _ := newD1TestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Two rows, single-column, so the alphabetical column-order fallback
+		// is deterministic.
+		_, _ = io.WriteString(w, `{
+			"success": true,
+			"result": [{
+				"success": true,
+				"results": [
+					{"id": "veh_01"},
+					{"id": "veh_02"}
+				]
+			}]
+		}`)
+	})
+
+	rows, err := c.Query(context.Background(), "SELECT id FROM vehicles")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var got []string
+	for rows.Next() {
+		var id string
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			t.Fatalf("Scan: %v", scanErr)
+		}
+		got = append(got, id)
+	}
+	if iterErr := rows.Err(); iterErr != nil {
+		t.Fatalf("Err: %v", iterErr)
+	}
+	if len(got) != 2 || got[0] != "veh_01" || got[1] != "veh_02" {
+		t.Fatalf("got rows %v, want [veh_01 veh_02]", got)
+	}
+}
+
+func TestD1_Query_EmptyResult(t *testing.T) {
+	c, _ := newD1TestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"success": true,
+			"result": [{"success": true, "results": []}]
+		}`)
+	})
+
+	rows, err := c.Query(context.Background(), "SELECT id FROM vehicles")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		t.Fatal("expected Next() == false on empty result")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("Err on empty result: %v", err)
+	}
+}
+
+func TestD1_Query_PropagatesHTTPError(t *testing.T) {
+	c, _ := newD1TestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"success":false}`)
+	})
+
+	_, err := c.Query(context.Background(), "SELECT 1")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized, got %v", err)
+	}
+}
+
+func TestD1_Query_ScanBeforeNext(t *testing.T) {
+	c, _ := newD1TestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{
+			"success": true,
+			"result": [{"success": true, "results": [{"id": "veh_01"}]}]
+		}`)
+	})
+	rows, err := c.Query(context.Background(), "SELECT id FROM vehicles")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var id string
+	if scanErr := rows.Scan(&id); scanErr == nil {
+		t.Fatal("Scan before Next must error")
+	}
+}
+
+func TestD1_Query_CloseIdempotent(t *testing.T) {
+	c, _ := newD1TestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{
+			"success": true,
+			"result": [{"success": true, "results": [{"id": "veh_01"}]}]
+		}`)
+	})
+	rows, err := c.Query(context.Background(), "SELECT id FROM vehicles")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if rows.Next() {
+		t.Fatal("Next after Close must return false")
+	}
+}
+
 func TestD1_AssignsAllScalarKinds(t *testing.T) {
 	c, _ := newD1TestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		// Use single-column rows to make Scan deterministic without
