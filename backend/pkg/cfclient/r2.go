@@ -184,3 +184,59 @@ func (c *R2Client) PresignGetObject(ctx context.Context, key string, ttl time.Du
 	}
 	return u, nil
 }
+
+// listObjectsMaxKeys is the per-call MaxKeys we send to R2's ListObjectsV2.
+// The S3 API allows up to 1000 per response; for our demo (3 photos per
+// vehicle per day) one page is always more than enough, so we do NOT
+// paginate. If a future caller needs > 1000 keys they should add a
+// pagination loop using NextContinuationToken — out of scope for TASK-022.
+const listObjectsMaxKeys = int32(1000)
+
+// ListObjects returns the object keys under the given prefix. Empty
+// prefix lists the whole bucket, which is fine for tests but rarely
+// what production code wants.
+//
+// Implementation: delegates to aws-sdk-go-v2's s3.ListObjectsV2 against
+// the configured bucket. We pick this over a hand-rolled XML parser for
+// the same reason as the presigner — the SDK is already in the dep tree
+// for TASK-005's PresignPutObject / PresignGetObject, so the marginal
+// cost of one more API call is zero new dependencies and zero new
+// code paths to maintain.
+//
+// Bounded to listObjectsMaxKeys (1000) per call — there is no pagination
+// today, so a prefix with more than 1000 objects will be silently
+// truncated. The R2 SDK does not error on truncation; callers that
+// suspect overflow should inspect the IsTruncated flag on the SDK
+// output, which we deliberately do not expose because TASK-022 caps
+// uploads at 3/vehicle/day (well under the limit).
+//
+// Returns a non-nil slice on success (possibly empty when the prefix is
+// unused). Errors are wrapped with the operation name so log lines
+// distinguish R2 list failures from presign failures.
+func (c *R2Client) ListObjects(ctx context.Context, prefix string) ([]string, error) {
+	in := &s3.ListObjectsV2Input{
+		Bucket:  aws.String(c.bucket),
+		MaxKeys: aws.Int32(listObjectsMaxKeys),
+	}
+	// Empty prefix is a valid "list everything" request — we only set
+	// the field when the caller supplied one so the SDK does not encode
+	// `&prefix=` redundantly. The SDK omits the param itself when the
+	// pointer is nil, so this is also a tiny wire-size optimisation.
+	if strings.TrimSpace(prefix) != "" {
+		in.Prefix = aws.String(prefix)
+	}
+
+	out, err := c.s3Client.ListObjectsV2(ctx, in)
+	if err != nil {
+		return nil, fmt.Errorf("cfclient.R2.ListObjects: %w", err)
+	}
+
+	keys := make([]string, 0, len(out.Contents))
+	for _, obj := range out.Contents {
+		if obj.Key == nil {
+			continue
+		}
+		keys = append(keys, *obj.Key)
+	}
+	return keys, nil
+}

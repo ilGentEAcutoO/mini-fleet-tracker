@@ -2,6 +2,9 @@ package cfclient
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -208,5 +211,180 @@ func TestR2_BadEndpointURL(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for malformed endpoint")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ListObjects — exercises the real aws-sdk-go-v2 wire path against an
+// httptest.Server that responds with canned ListBucketResult XML. We can't
+// reuse newR2TestClient here because that points at a fake hostname; the
+// SDK would refuse to talk to it. So we build a dedicated httptest-backed
+// client per test, which also lets each test assert on the request URL and
+// query params the SDK actually sent.
+// ---------------------------------------------------------------------------
+
+// newR2ListTestClient builds an R2Client whose endpoint points at the
+// provided httptest server. The server's handler should respond with a
+// ListBucketResult XML envelope for ListObjectsV2 to parse.
+func newR2ListTestClient(t *testing.T, srv *httptest.Server) *R2Client {
+	t.Helper()
+	c, err := NewR2Client(context.Background(), R2Config{
+		Endpoint:        srv.URL,
+		AccessKeyID:     "AKIA-TEST",
+		SecretAccessKey: "secret-test",
+		BucketName:      "mft-r2-photos",
+	})
+	if err != nil {
+		t.Fatalf("NewR2Client: %v", err)
+	}
+	return c
+}
+
+func TestR2_ListObjects_HappyPath(t *testing.T) {
+	var gotMethod, gotPath, gotPrefix, gotMaxKeys string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotPrefix = r.URL.Query().Get("prefix")
+		gotMaxKeys = r.URL.Query().Get("max-keys")
+		// Canonical ListBucketResult v2 envelope — three keys under the
+		// requested prefix. The SDK parses xmlns="http://s3.amazonaws.com/doc/2006-03-01/"
+		// even though R2 also accepts the namespace-less form.
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>mft-r2-photos</Name>
+  <Prefix>vehicles/veh-1/</Prefix>
+  <KeyCount>3</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>vehicles/veh-1/a.jpg</Key>
+    <LastModified>2026-05-19T00:00:00.000Z</LastModified>
+    <ETag>"deadbeef"</ETag>
+    <Size>1024</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <Contents>
+    <Key>vehicles/veh-1/b.jpg</Key>
+    <LastModified>2026-05-19T00:01:00.000Z</LastModified>
+    <ETag>"deadbeef"</ETag>
+    <Size>2048</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <Contents>
+    <Key>vehicles/veh-1/c.jpg</Key>
+    <LastModified>2026-05-19T00:02:00.000Z</LastModified>
+    <ETag>"deadbeef"</ETag>
+    <Size>4096</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newR2ListTestClient(t, srv)
+	keys, err := c.ListObjects(context.Background(), "vehicles/veh-1/")
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(keys) != 3 {
+		t.Fatalf("len(keys) = %d, want 3 (keys=%v)", len(keys), keys)
+	}
+	want := []string{"vehicles/veh-1/a.jpg", "vehicles/veh-1/b.jpg", "vehicles/veh-1/c.jpg"}
+	for i, k := range want {
+		if keys[i] != k {
+			t.Errorf("keys[%d] = %q, want %q", i, keys[i], k)
+		}
+	}
+	// Wire-level assertions: the SDK should send GET /<bucket>/?list-type=2&prefix=...&max-keys=1000.
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q, want GET", gotMethod)
+	}
+	if !strings.Contains(gotPath, "/mft-r2-photos") {
+		t.Errorf("path = %q, want bucket in path", gotPath)
+	}
+	if gotPrefix != "vehicles/veh-1/" {
+		t.Errorf("prefix query = %q, want vehicles/veh-1/", gotPrefix)
+	}
+	if gotMaxKeys != "1000" {
+		t.Errorf("max-keys query = %q, want 1000", gotMaxKeys)
+	}
+}
+
+func TestR2_ListObjects_EmptyPrefixOmitsParam(t *testing.T) {
+	var gotPrefix string
+	var prefixPresent bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, prefixPresent = r.URL.Query()["prefix"]
+		gotPrefix = r.URL.Query().Get("prefix")
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <KeyCount>0</KeyCount>
+  <IsTruncated>false</IsTruncated>
+</ListBucketResult>`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newR2ListTestClient(t, srv)
+	keys, err := c.ListObjects(context.Background(), "   ")
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("len(keys) = %d, want 0 (no contents)", len(keys))
+	}
+	if prefixPresent && gotPrefix != "" {
+		t.Errorf("prefix param should be omitted on blank input, got %q", gotPrefix)
+	}
+}
+
+func TestR2_ListObjects_NoContents(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// A list with no <Contents> elements — typical for an empty prefix.
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>mft-r2-photos</Name>
+  <Prefix>vehicles/empty/</Prefix>
+  <KeyCount>0</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+</ListBucketResult>`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newR2ListTestClient(t, srv)
+	keys, err := c.ListObjects(context.Background(), "vehicles/empty/")
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	// Non-nil empty slice — required by the doc-comment contract so
+	// callers can `for _, k := range keys` without a nil-guard.
+	if keys == nil {
+		t.Error("expected non-nil empty slice on no-contents response")
+	}
+	if len(keys) != 0 {
+		t.Errorf("len(keys) = %d, want 0", len(keys))
+	}
+}
+
+func TestR2_ListObjects_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		// AWS-style XML error so the SDK's error parser has something to chew on.
+		_, _ = fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>InternalError</Code><Message>boom</Message></Error>`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newR2ListTestClient(t, srv)
+	_, err := c.ListObjects(context.Background(), "vehicles/veh-1/")
+	if err == nil {
+		t.Fatal("expected error on 500 response")
+	}
+	if !strings.Contains(err.Error(), "cfclient.R2.ListObjects") {
+		t.Errorf("error should be wrapped with op name: %v", err)
 	}
 }
