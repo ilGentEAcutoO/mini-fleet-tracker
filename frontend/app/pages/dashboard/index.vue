@@ -1,39 +1,148 @@
 <script setup lang="ts">
-// Placeholder for TASK-017. For TASK-009 (auth flow) we only need to prove
-// that:
-//   1. the global middleware redirects unauthenticated users to /login
-//   2. an authenticated user can read their session via useAuthStore
-//   3. logout clears the session and bounces to /login
+// Dashboard home — the live-fleet surface.
 //
-// Map, vehicle list, and history all arrive in later tasks.
+// Owns three pieces:
+//   1. <MapView> bound to fleet.positions (live, WS-driven)
+//   2. <LiveBadge> reflecting fleet.status (Live / Reconnecting / Offline)
+//   3. A manager-only vehicle list sidebar (the driver dashboard is the same
+//      map without the sidebar — drivers don't need to see fleet roster
+//      from this page)
+//
+// Lifecycle: this page is the long-lived owner that calls fleet.connect()
+// on mount and fleet.disconnect() on unmount. Per the fleet store doc
+// comment, that pattern guards against premature teardown — short-lived
+// children must NOT be the first consumer of useFleetStore().
+//
+// API contract: backend wraps list responses as `{ vehicles: [...] }`
+// (see backend/internal/handler/vehicle_handler.go:vehicleListBody), so the
+// fetch unwraps once and stores the bare array.
+
+import type { Vehicle } from '~~/shared/types/domain'
 
 definePageMeta({ layout: 'default' })
 useHead({ title: 'Dashboard' })
 
 const auth = useAuthStore()
-const router = useRouter()
+const fleet = useFleetStore()
+const api = useApi()
 
-async function signOut(): Promise<void> {
-  await auth.logout()
-  await router.push('/login')
+const vehicles = ref<Vehicle[]>([])
+const loadingVehicles = ref(false)
+const vehicleError = ref<string | null>(null)
+
+async function fetchVehicles(): Promise<void> {
+  // Drivers don't see the fleet roster on this page — the backend returns
+  // 403 for non-managers so we short-circuit to avoid a guaranteed 403 in
+  // the network panel.
+  if (!auth.isManager) return
+  loadingVehicles.value = true
+  vehicleError.value = null
+  try {
+    const res = await api<{ vehicles: Vehicle[] }>('/vehicles')
+    vehicles.value = res.vehicles
+  }
+  catch (err: unknown) {
+    const e = err as { data?: { message?: string } } | undefined
+    vehicleError.value = e?.data?.message ?? 'Failed to load vehicles'
+  }
+  finally {
+    loadingVehicles.value = false
+  }
 }
+
+onMounted(() => {
+  fleet.connect()
+  void fetchVehicles()
+})
+
+onBeforeUnmount(() => {
+  fleet.disconnect()
+})
+
+// Map center: most recent live position, or Bangkok (the demo dataset's
+// area) for the cold-start empty state. The Map iterates in insertion
+// order, so `.at(-1)` is whichever vehicle last broadcast — a reasonable
+// "follow the action" default for an empty dashboard.
+const center = computed(() => {
+  const latest = Array.from(fleet.positions.values()).at(-1)
+  return latest ? { lat: latest.lat, lng: latest.lng } : { lat: 13.7563, lng: 100.5018 }
+})
 </script>
 
 <template>
-  <section class="space-y-4">
-    <h1 class="text-2xl font-semibold tracking-tight">
-      Dashboard
-    </h1>
-    <p class="text-muted-foreground">
-      Signed in as
-      <span class="font-medium">{{ auth.user?.email }}</span>
-      (role: {{ auth.user?.role }}).
-    </p>
-    <p class="text-sm text-muted-foreground">
-      Live map, vehicle list, and history come in later tasks.
-    </p>
-    <Button variant="outline" @click="signOut">
-      Sign out
-    </Button>
-  </section>
+  <div class="grid gap-4 lg:grid-cols-[1fr_320px]">
+    <section class="space-y-3">
+      <div class="flex items-center justify-between">
+        <h1 class="text-2xl font-semibold tracking-tight">
+          Live fleet
+        </h1>
+        <LiveBadge />
+      </div>
+      <MapView
+        :positions="fleet.positions"
+        :center="center"
+        class-name="h-[560px] w-full rounded-md border border-border"
+      />
+    </section>
+
+    <aside v-if="auth.isManager" class="space-y-3">
+      <Card>
+        <CardHeader>
+          <CardTitle class="text-base">
+            Vehicles
+          </CardTitle>
+          <CardDescription>{{ vehicles.length }} in fleet</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <p
+            v-if="loadingVehicles"
+            class="text-sm text-muted-foreground"
+          >
+            Loading…
+          </p>
+          <p
+            v-else-if="vehicleError"
+            class="text-sm text-destructive"
+            role="alert"
+          >
+            {{ vehicleError }}
+          </p>
+          <p
+            v-else-if="vehicles.length === 0"
+            class="text-sm text-muted-foreground"
+          >
+            No vehicles yet.
+          </p>
+          <ul v-else class="space-y-2">
+            <li
+              v-for="v in vehicles"
+              :key="v.id"
+              class="flex items-center justify-between text-sm"
+            >
+              <span class="truncate">
+                {{ v.plate_number }}
+                <span
+                  v-if="v.model"
+                  class="text-muted-foreground"
+                > · {{ v.model }}</span>
+              </span>
+              <span
+                v-if="fleet.positions.has(v.id)"
+                class="text-xs text-emerald-600"
+              >live</span>
+            </li>
+          </ul>
+          <Button
+            as-child
+            variant="outline"
+            class="mt-3 w-full"
+          >
+            <NuxtLink to="/dashboard/vehicles">
+              Manage vehicles
+            </NuxtLink>
+          </Button>
+        </CardContent>
+      </Card>
+    </aside>
+  </div>
 </template>
