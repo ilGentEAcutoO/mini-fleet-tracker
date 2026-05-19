@@ -25,6 +25,7 @@ async function signOut(): Promise<void> {
 
 <template>
   <div class="min-h-screen bg-background text-foreground">
+    <DemoBanner />
     <header class="border-b border-border">
       <div class="container mx-auto flex h-14 items-center gap-6 px-4">
         <NuxtLink to="/" class="font-semibold tracking-tight">

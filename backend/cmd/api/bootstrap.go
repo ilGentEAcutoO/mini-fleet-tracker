@@ -339,6 +339,18 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	app.Use(middleware.RequestID())
 	app.Use(corsMiddleware)
 	app.Use(middleware.Logger())
+
+	// Demo expiration short-circuit (TASK-030). Runs AFTER request_id/cors/
+	// logger so an expired request is still observable in logs with the
+	// correct CORS headers, but BEFORE globalRL so a 410 doesn't burn a
+	// global-rate-limit token on a request the API was never going to
+	// serve. /healthz is exempted inside the middleware so liveness probes
+	// keep working after the cutoff.
+	app.Use(middleware.NewDemoExpiry(middleware.ExpiryConfig{
+		ExpiresAt: demoExpiresAt,
+		RepoURL:   "https://github.com/ilGentEAcutoO/mini-fleet-tracker",
+	}))
+
 	app.Use(globalRL)
 
 	// --- Routes ---------------------------------------------------------

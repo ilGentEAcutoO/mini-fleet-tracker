@@ -26,10 +26,19 @@ const CSP_HEADER =
   "base-uri 'self';"
 
 // DEMO_EXPIRES_AT is the cost-protection kill-switch landed by TASK-030.
-// After this instant the gateway short-circuits to 410 Gone. The const
-// ships now so TASK-030 only needs to wire the comparison.
-// TODO(TASK-030): branch on Date.now() >= DEMO_EXPIRES_AT_UNIX_MS.
-export const DEMO_EXPIRES_AT = '2026-05-31T23:59:59+07:00'
+// After this instant the gateway short-circuits to 410 Gone — the
+// actual cost saver, because a 410 from the Worker never wakes the
+// Container. The Date object is constructed once at module load.
+//
+// CORS preflights (OPTIONS) are NOT short-circuited: a browser may
+// still need to see the allow-origin headers before deciding to issue
+// the real request — which will then receive the 410. /healthz is also
+// exempted so an external monitor can still probe the upstream's
+// liveness after expiration.
+//
+// The const must be edited + redeployed to revive the demo. The deliberate
+// friction is the point of TASK-030 cost-protection layer 2.
+export const DEMO_EXPIRES_AT = new Date('2026-05-31T23:59:59+07:00')
 
 // Bindings + vars surface for the gateway worker. Mirrors gateway/wrangler.toml.
 export interface Env {
@@ -61,9 +70,28 @@ export default {
 
     // CORS preflight is handled at the edge for every route — saves a
     // round-trip to the upstream and gives us one place to enforce the
-    // allow-list.
+    // allow-list. Preflights are exempt from the demo-expiry guard
+    // below so a browser can still observe the CORS posture and surface
+    // a clean 410 on the actual request.
     if (req.method === 'OPTIONS') {
       return handleCORSPreflight(req, env)
+    }
+
+    // Demo expiration short-circuit (TASK-030). /healthz forwards
+    // through so a monitor can still see the upstream's per-dep status;
+    // every other path returns the 410 envelope without touching the
+    // Container. This is what makes the cost-protection real: the
+    // Worker handles the request itself, the Container never wakes.
+    if (new Date() > DEMO_EXPIRES_AT && !path.endsWith('/healthz')) {
+      return new Response(
+        JSON.stringify({
+          error: 'demo_expired',
+          message: 'This demo expired on 2026-05-31. See the repo for the source.',
+          repo_url: 'https://github.com/ilGentEAcutoO/mini-fleet-tracker',
+          expired_at: DEMO_EXPIRES_AT.toISOString(),
+        }),
+        { status: 410, headers: { 'content-type': 'application/json' } },
+      )
     }
 
     if (path === '/internal/publish') {

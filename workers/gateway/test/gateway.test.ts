@@ -310,6 +310,138 @@ describe('unknown paths', () => {
   })
 })
 
+// ============================================================================
+// Demo expiration short-circuit (TASK-030)
+// ============================================================================
+
+describe('demo expiration', () => {
+  // vi.setSystemTime is the right tool here: the gateway constructs
+  // `new Date()` on every request, and setSystemTime moves the runtime
+  // clock so that constructor returns our chosen instant. The
+  // DEMO_EXPIRES_AT module-level Date was constructed at import time
+  // BEFORE the fake clock applies, so it keeps its real value.
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('returns 410 demo_expired for /api/* after the cutoff', async () => {
+    // Set the clock to one day after the cutoff. The cutoff is
+    // 2026-05-31T23:59:59+07:00 == 2026-05-31T16:59:59Z.
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+
+    const res = await SELF.fetch('https://gateway.example/api/anything', {
+      method: 'GET',
+      headers: { Origin: ALLOWED_ORIGIN },
+    })
+    expect(res.status).toBe(410)
+    const body = (await res.json()) as {
+      error: string
+      message: string
+      repo_url: string
+      expired_at: string
+    }
+    expect(body.error).toBe('demo_expired')
+    expect(body.expired_at).toMatch(/2026-05-31T/)
+    expect(body.repo_url).toContain('github.com')
+    expect(body.message).toContain('2026-05-31')
+  })
+
+  it('forwards /healthz to the upstream even after the cutoff', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    // Spy on global fetch so we can confirm the upstream call happened.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url
+      if (url.startsWith(env.API_UPSTREAM_URL)) {
+        return new Response(JSON.stringify({ status: 'ok' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('unhandled', { status: 500 })
+    })
+    try {
+      const res = await SELF.fetch('https://gateway.example/healthz', {
+        method: 'GET',
+      })
+      // The gateway has no explicit /healthz route (it 404s); the
+      // point of this test is the demo-expiry guard does NOT
+      // short-circuit /healthz. Status 404 is acceptable here — the
+      // important assertion is "NOT 410". /api/healthz is the path
+      // operators actually hit; tested below.
+      expect(res.status).not.toBe(410)
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
+  it('forwards /api/healthz to the upstream even after the cutoff', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url
+      if (url.startsWith(env.API_UPSTREAM_URL)) {
+        return new Response(JSON.stringify({ status: 'ok' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('unhandled', { status: 500 })
+    })
+    try {
+      const res = await SELF.fetch('https://gateway.example/api/healthz', {
+        method: 'GET',
+        headers: { Origin: ALLOWED_ORIGIN },
+      })
+      expect(res.status).toBe(200)
+      expect(fetchSpy).toHaveBeenCalled()
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
+  it('still serves CORS preflight (OPTIONS) after the cutoff', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    const res = await SELF.fetch('https://gateway.example/api/anything', {
+      method: 'OPTIONS',
+      headers: {
+        Origin: ALLOWED_ORIGIN,
+        'Access-Control-Request-Method': 'POST',
+      },
+    })
+    // Preflight passes the allow-list and returns 204; the demo-expiry
+    // guard does not intercept OPTIONS because the browser may need
+    // to read the CORS posture before deciding to issue the real
+    // request (which then itself gets the 410).
+    expect(res.status).toBe(204)
+  })
+
+  it('does not 410 before the cutoff', async () => {
+    vi.setSystemTime(new Date('2026-05-30T00:00:00Z'))
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url
+      if (url.startsWith(env.API_UPSTREAM_URL)) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('unhandled', { status: 500 })
+    })
+    try {
+      const res = await SELF.fetch('https://gateway.example/api/anything', {
+        method: 'GET',
+        headers: { Origin: ALLOWED_ORIGIN },
+      })
+      expect(res.status).toBe(200)
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+})
+
 describe('CSP injection', () => {
   // The withCORS helper inspects Content-Type to decide whether to add
   // CSP. The upstream HTML response is fabricated via the fetch spy so

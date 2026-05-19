@@ -6,7 +6,7 @@
 // We split into two suites: pure helpers (no Workers runtime needed)
 // and integration (HMAC + JWT against the live DO).
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { env, SELF, runInDurableObject } from 'cloudflare:test'
 import { sign } from '@tsndr/cloudflare-worker-jwt'
 import {
@@ -425,5 +425,109 @@ describe('FleetHub default route', () => {
   it('returns 404 for unknown paths', async () => {
     const res = await SELF.fetch('https://test.example/who-knows', { method: 'GET' })
     expect(res.status).toBe(404)
+  })
+})
+
+// ============================================================================
+// Demo expiration (TASK-030)
+// ============================================================================
+//
+// The DO consults `new Date()` at request time. vi.setSystemTime moves
+// the runtime clock so we can drive both "before" and "after" the
+// 2026-05-31T23:59:59+07:00 cutoff. The DEMO_EXPIRES_AT module constant
+// was constructed at import time before the fake clock applies, so its
+// value is real and stable.
+
+describe('demo expiration', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('rejects POST /publish with 410 after the cutoff (no HMAC needed)', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    // Build a perfectly valid signed body; the guard fires BEFORE the
+    // HMAC check, so the 410 is the only possible outcome.
+    const body = JSON.stringify({
+      type: 'position.update',
+      vehicle_id: 'v-after',
+      lat: 1,
+      lng: 2,
+      recorded_at: 99,
+    })
+    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const res = await SELF.fetch('https://test.example/publish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      body,
+    })
+    expect(res.status).toBe(410)
+    expect(await res.text()).toBe('demo_expired')
+  })
+
+  it('rejects WebSocket upgrade with 410 after the cutoff (no JWT needed)', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    // signValidJwt() under fake timers signs against the fake `now` —
+    // the token's iat/exp end up nonsense for the real verifier but
+    // it doesn't matter: the demo-expiry guard short-circuits before
+    // verifyJwt runs.
+    const res = await SELF.fetch('https://test.example/upgrade', {
+      method: 'GET',
+      headers: {
+        Upgrade: 'websocket',
+        Origin: ALLOWED_ORIGIN,
+        Cookie: 'auth_token=anything-the-guard-fires-first',
+      },
+    })
+    expect(res.status).toBe(410)
+    expect(await res.text()).toBe('demo_expired')
+  })
+
+  it('still answers 426 for non-WebSocket /upgrade requests after the cutoff', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    // The 426 check comes BEFORE the demo-expiry check — a probe
+    // that's not even a WS upgrade gets the existing hint, not a
+    // misleading 410.
+    const res = await SELF.fetch('https://test.example/upgrade', {
+      method: 'GET',
+      headers: {
+        Origin: ALLOWED_ORIGIN,
+        Cookie: 'auth_token=tk',
+      },
+    })
+    expect(res.status).toBe(426)
+  })
+
+  it('does not 410 publishes before the cutoff', async () => {
+    vi.setSystemTime(new Date('2026-05-30T00:00:00Z'))
+    const body = JSON.stringify({
+      type: 'position.update',
+      vehicle_id: 'v-before',
+      lat: 1,
+      lng: 2,
+      recorded_at: 99,
+    })
+    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const res = await SELF.fetch('https://test.example/publish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      body,
+    })
+    expect(res.status).toBe(204)
+  })
+
+  it('still answers 405 for the wrong method on /publish after the cutoff', async () => {
+    // /publish's method check happens BEFORE the demo-expiry guard so
+    // a GET against /publish after the cutoff returns the existing
+    // 405, not 410. Keeps the response shapes deterministic for
+    // observability tooling that filters on status code.
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    const res = await SELF.fetch('https://test.example/publish', {
+      method: 'GET',
+    })
+    expect(res.status).toBe(405)
   })
 })

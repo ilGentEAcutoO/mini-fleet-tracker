@@ -25,12 +25,16 @@ import { DurableObject } from 'cloudflare:workers'
 import { verify, decode } from '@tsndr/cloudflare-worker-jwt'
 
 // DEMO_EXPIRES_AT is the cost-protection kill-switch landed by TASK-030.
-// After this instant the DO rejects all WS upgrades and broadcasts a
-// final close to live sockets. The const ships now so TASK-030 only has
-// to wire the comparison — and so reviewers can find the policy in one
-// place. Format: ISO-8601 UTC.
-// TODO(TASK-030): branch on Date.now() >= DEMO_EXPIRES_AT_UNIX_MS.
-export const DEMO_EXPIRES_AT = '2026-05-31T23:59:59+07:00'
+// After this instant the DO rejects WS upgrades and /publish posts.
+// Even if a residual Container with an old expiry tries to push events
+// through, this guard at the DO boundary stops the broadcast. The Date
+// object is constructed once at module load.
+//
+// The const must be edited + redeployed to revive the demo (one of the
+// three deployable artefacts that need to change — gateway, DO,
+// backend). Friction is the point: revival is a deliberate 5-step
+// workflow documented in ARCHITECTURE.md, not a single env-var flip.
+export const DEMO_EXPIRES_AT = new Date('2026-05-31T23:59:59+07:00')
 
 // Env is the bindings + vars surface declared in wrangler.toml.
 // The interface is exported because tests construct mock envs against
@@ -103,6 +107,14 @@ export class FleetHub extends DurableObject<Env> {
       return new Response('method not allowed', { status: 405 })
     }
 
+    // Demo-expiry guard (TASK-030). Belt-and-braces with the gateway:
+    // even if a residual Container managed to forward a /publish past
+    // the expiry, the DO refuses to fan it out. Returned BEFORE the HMAC
+    // check so we don't spend cycles validating a doomed payload.
+    if (new Date() > DEMO_EXPIRES_AT) {
+      return new Response('demo_expired', { status: 410 })
+    }
+
     const sigHeader = req.headers.get('X-Signature') ?? ''
     if (sigHeader === '') {
       return new Response('missing signature', { status: 401 })
@@ -161,6 +173,14 @@ export class FleetHub extends DurableObject<Env> {
   private async handleUpgrade(req: Request): Promise<Response> {
     if (req.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('expected websocket upgrade', { status: 426 })
+    }
+
+    // Demo-expiry guard (TASK-030). Reject the upgrade before we burn
+    // a JWT verify on a doomed connection. The 426 check above stays
+    // first so a non-WS probe still gets the correct hint; everything
+    // else falls through to 410.
+    if (new Date() > DEMO_EXPIRES_AT) {
+      return new Response('demo_expired', { status: 410 })
     }
 
     // 1. Origin allow-list. Defense against cross-site WebSocket
