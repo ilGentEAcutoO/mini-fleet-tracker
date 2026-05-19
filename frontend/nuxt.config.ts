@@ -9,6 +9,15 @@ export default defineNuxtConfig({
   typescript: {
     strict: true,
     typeCheck: true,
+    // Nuxt sets `types: []` in the generated tsconfig to disable automatic
+    // @types/* discovery; we opt `google.maps` back in so the `google` global
+    // namespace is visible inside MapView.vue / useGoogleMaps.ts without each
+    // file needing a triple-slash reference (.vue files can't host those).
+    tsConfig: {
+      compilerOptions: {
+        types: ['google.maps'],
+      },
+    },
   },
 
   modules: ['@pinia/nuxt', 'shadcn-nuxt', '@nuxt/eslint'],
