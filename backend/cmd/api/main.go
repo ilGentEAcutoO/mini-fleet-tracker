@@ -3,10 +3,12 @@
 // Bootstrap responsibilities:
 //   - parse the demo expiration timestamp (cost-protection layer 2)
 //   - configure zerolog for the current environment
-//   - wire a minimal Fiber app with /healthz
+//   - load config, build CF clients + repos + usecases + handlers, and
+//     compose them into the Fiber app via setupApp in bootstrap.go
 //   - listen on $PORT and shut down cleanly on SIGINT/SIGTERM
 //
-// Business handlers, repositories, and middlewares are added by later tasks.
+// All wiring lives in bootstrap.go so this file stays under ~100 lines and
+// is easy to scan for the boot sequence at a glance.
 package main
 
 import (
@@ -19,11 +21,10 @@ import (
 	"syscall"
 	"time"
 
-	fiberzerolog "github.com/gofiber/contrib/fiberzerolog"
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"github.com/ilGentEAcutoO/mini-fleet-tracker/backend/internal/config"
 )
 
 // DemoExpiresAt is the hard cut-off for the public Zero Friction demo.
@@ -56,29 +57,18 @@ func main() {
 		gitCommit = envCommit
 	}
 
-	app := fiber.New(fiber.Config{
-		AppName:               "mini-fleet-tracker-backend",
-		DisableStartupMessage: true,
-		ReadTimeout:           15 * time.Second,
-		WriteTimeout:          15 * time.Second,
-		IdleTimeout:           60 * time.Second,
-	})
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatal().Err(err).Msg("config load failed")
+	}
 
-	app.Use(recover.New())
-	app.Use(fiberzerolog.New(fiberzerolog.Config{
-		Logger: &log.Logger,
-		Fields: []string{"latency", "status", "method", "url", "ip", "ua"},
-	}))
+	app, cleanup, err := setupApp(cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("setup failed")
+	}
+	defer cleanup()
 
-	app.Get("/healthz", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status":          "ok",
-			"commit":          gitCommit,
-			"demo_expires_at": DemoExpiresAt,
-		})
-	})
-
-	port := strings.TrimSpace(os.Getenv("PORT"))
+	port := strings.TrimSpace(cfg.Port)
 	if port == "" {
 		port = "8080"
 	}
