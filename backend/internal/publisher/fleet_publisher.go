@@ -104,3 +104,48 @@ func (p *FleetPublisher) PublishPositionUpdate(ctx context.Context, pos *domain.
 		RecordedAt: pos.RecordedAt,
 	})
 }
+
+// geofenceAlertEvent is the JSON wire shape the Durable Object's
+// isFleetEvent guard expects for geofence.alert events
+// (workers/fleet-hub/src/fleet-hub.ts:FleetEvent). Keys are
+// lower_snake_case so the JSON matches the TypeScript side
+// byte-for-byte; AlertType is constrained to "enter" or "exit" by the
+// caller (PositionUsecase) before this struct is constructed — we do
+// not validate again here because there is exactly one call site.
+//
+// Note on the "alert_type" key naming: the DO guard inspects this
+// exact string. Renaming the key (to e.g. "type") would silently
+// break the broadcast — the event would be rejected at /publish time
+// with a 400 — so the JSON tag is load-bearing.
+type geofenceAlertEvent struct {
+	Type      string `json:"type"`       // always "geofence.alert"
+	VehicleID string `json:"vehicle_id"` // owning vehicle
+	AlertType string `json:"alert_type"` // "enter" | "exit"
+	At        int64  `json:"at"`         // unix-ms when the transition happened
+}
+
+// PublishGeofenceAlert sends a geofence.alert event to the Durable
+// Object via the same HMAC-signed POST mechanism. Same best-effort
+// semantics as PublishPositionUpdate — the usecase logs failures at
+// warn level and the request still succeeds.
+//
+// vehicleID and alertType are required and non-empty (the usecase
+// guarantees this; we do not double-validate at this seam). The `at`
+// timestamp is the position's recorded_at, not the server's now —
+// operators care about when the transition happened in the field.
+//
+// alertType "enter" | "exit" is enforced by the upstream usecase via a
+// branch on inside/outside transition direction. We deliberately keep
+// the parameter as a string rather than a typed enum because the
+// EventPublisher interface ships through three layers (usecase,
+// publisher, cfclient) and adding a domain-level enum would create
+// import-cycle pain for no real safety dividend — the value is set
+// from exactly one branch in one function.
+func (p *FleetPublisher) PublishGeofenceAlert(ctx context.Context, vehicleID, alertType string, at int64) error {
+	return p.client.Publish(ctx, geofenceAlertEvent{
+		Type:      "geofence.alert",
+		VehicleID: vehicleID,
+		AlertType: alertType,
+		At:        at,
+	})
+}

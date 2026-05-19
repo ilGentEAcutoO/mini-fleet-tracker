@@ -23,12 +23,24 @@ import (
 // memPositionRepo records every Insert call and lets tests inject errors.
 // The repo populates p.ID (auto-increment) and p.CreatedAt before
 // returning, mirroring the production repo's contract.
+//
+// GetMostRecentByVehicleBeforeID (added in TASK-020) walks the captured
+// inserts in reverse insertion order and returns the first row whose
+// vehicle_id matches and whose id is strictly less than excludeID. The
+// in-memory order matches the production repo's id-DESC ordering
+// because m.nextID is monotonic.
 type memPositionRepo struct {
 	mu        sync.Mutex
 	inserts   []*domain.Position
 	nextID    int64
 	createdAt int64 // unix-ms; tests can pin this to verify the repo-stamped timestamp
 	failWith  error // when non-nil, Insert returns this error and records nothing
+	// failPrevWith lets tests inject a non-ErrNotFound error from the
+	// transition-detection's previous-position lookup, so the warn-log
+	// path is exercisable without forging a real DB error. Defaults to
+	// nil; methods route ErrNotFound through the normal "no predecessor"
+	// path regardless of this field.
+	failPrevWith error
 }
 
 func newMemPositionRepo() *memPositionRepo {
@@ -47,6 +59,32 @@ func (m *memPositionRepo) Insert(_ context.Context, p *domain.Position) error {
 	cp := *p
 	m.inserts = append(m.inserts, &cp)
 	return nil
+}
+
+func (m *memPositionRepo) GetMostRecentByVehicleBeforeID(
+	_ context.Context,
+	vehicleID string,
+	excludeID int64,
+) (*domain.Position, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failPrevWith != nil {
+		return nil, m.failPrevWith
+	}
+	// Walk inserts in reverse so we find the largest id < excludeID for
+	// the given vehicle. Mirrors the production ORDER BY id DESC LIMIT 1.
+	for i := len(m.inserts) - 1; i >= 0; i-- {
+		p := m.inserts[i]
+		if p.VehicleID != vehicleID {
+			continue
+		}
+		if p.ID >= excludeID {
+			continue
+		}
+		cp := *p
+		return &cp, nil
+	}
+	return nil, fmt.Errorf("previous position for vehicle %s: %w", vehicleID, domain.ErrNotFound)
 }
 
 // memVehicleLookup is the in-memory ownership lookup. Tests pre-load
@@ -86,12 +124,31 @@ func (m *memVehicleLookup) Get(_ context.Context, vehicleID string) (*domain.Veh
 	return &domain.Vehicle{ID: vehicleID, DriverID: driverID}, nil
 }
 
-// spyPublisher captures every PublishPositionUpdate call and lets tests
-// inject errors to exercise the best-effort log-on-failure path.
+// spyPublisher captures every PublishPositionUpdate / PublishGeofenceAlert
+// call and lets tests inject errors to exercise the best-effort
+// log-on-failure paths.
+//
+// Geofence alerts (TASK-020) are captured separately from position
+// updates because the two event types have different shapes and most
+// tests only care about one or the other — keeping the slices
+// separate means assertions stay focused.
 type spyPublisher struct {
 	mu       sync.Mutex
-	calls    []*domain.Position
-	failWith error // when non-nil, PublishPositionUpdate returns this error
+	calls    []*domain.Position // captured PublishPositionUpdate
+	alerts   []capturedAlert    // captured PublishGeofenceAlert
+	failWith error              // when non-nil, PublishPositionUpdate returns this error
+	// alertFailWith lets tests force a failing geofence publish while
+	// keeping the position publish path healthy. Defaults to nil.
+	alertFailWith error
+}
+
+// capturedAlert is the immutable snapshot of one PublishGeofenceAlert
+// call. Plain struct (not a pointer to the in-memory state) so the
+// captured value cannot be mutated by later test code.
+type capturedAlert struct {
+	vehicleID string
+	alertType string
+	at        int64
 }
 
 func newSpyPublisher() *spyPublisher { return &spyPublisher{} }
@@ -102,6 +159,17 @@ func (s *spyPublisher) PublishPositionUpdate(_ context.Context, p *domain.Positi
 	cp := *p
 	s.calls = append(s.calls, &cp)
 	return s.failWith
+}
+
+func (s *spyPublisher) PublishGeofenceAlert(_ context.Context, vehicleID, alertType string, at int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.alerts = append(s.alerts, capturedAlert{
+		vehicleID: vehicleID,
+		alertType: alertType,
+		at:        at,
+	})
+	return s.alertFailWith
 }
 
 // captureLogs reroutes the package-level zerolog Logger to a buffer for
@@ -648,5 +716,327 @@ func TestWrite_NoopPublisher_RealConfigPath(t *testing.T) {
 	}
 	if p == nil || p.ID == 0 {
 		t.Fatalf("position must be returned with ID populated, got %+v", p)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TASK-020 — geofence transition detection. The Write path consults the
+// fences lookup AFTER the position is durably inserted; if the
+// inside/outside state changed across the previous reading and the
+// current one, a geofence.alert is emitted via the publisher.
+//
+// Six cases cover the matrix:
+//
+//   - no fence configured → no alert
+//   - prev inside,  curr inside  → no alert
+//   - prev outside, curr outside → no alert
+//   - prev inside,  curr outside → alert with type=exit
+//   - prev outside, curr inside  → alert with type=enter
+//   - no previous position (first ever) → no alert
+//
+// Plus the negative-path cases:
+//   - fences-lookup nil-nil → no alert, no panic
+//   - alert-publish failure → request still succeeds, warning logged
+// ---------------------------------------------------------------------------
+
+// memGeofenceLookup is the in-memory fence lookup used by the
+// transition-detection tests. Tests pre-load (vehicleID -> fence)
+// mappings; absent keys return ErrNotFound (matching the "no fence
+// configured" semantic).
+type memGeofenceLookup struct {
+	mu       sync.Mutex
+	fences   map[string]*domain.Geofence
+	failWith error // when non-nil, GetByVehicle returns this error for any key
+}
+
+func newMemGeofenceLookup() *memGeofenceLookup {
+	return &memGeofenceLookup{fences: map[string]*domain.Geofence{}}
+}
+
+func (m *memGeofenceLookup) Set(g *domain.Geofence) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fences[g.VehicleID] = g
+}
+
+func (m *memGeofenceLookup) GetByVehicle(_ context.Context, vehicleID string) (*domain.Geofence, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failWith != nil {
+		return nil, m.failWith
+	}
+	g, ok := m.fences[vehicleID]
+	if !ok {
+		return nil, fmt.Errorf("fence for vehicle %s: %w", vehicleID, domain.ErrNotFound)
+	}
+	cp := *g
+	return &cp, nil
+}
+
+// bangkokFence returns a 500-m fence centred on the Wat Pho area. The
+// inside/outside test points below are chosen to be unambiguously
+// inside/outside this fence by a wide margin so the test does not flake
+// on floating-point edge cases.
+func bangkokFence(vehicleID string) *domain.Geofence {
+	return &domain.Geofence{
+		ID:        "fence_test",
+		VehicleID: vehicleID,
+		CenterLat: 13.7464,
+		CenterLng: 100.4929,
+		RadiusM:   500,
+		CreatedAt: 1_700_000_000_000,
+	}
+}
+
+// insidePoint and outsidePoint are coordinates clearly inside / outside
+// the bangkokFence. Distance is on the order of ~10 m for inside and
+// ~10 km for outside, so both classifications are unambiguous.
+var (
+	insidePoint  = struct{ lat, lng float64 }{lat: 13.7464, lng: 100.4929} // dead centre
+	outsidePoint = struct{ lat, lng float64 }{lat: 13.8000, lng: 100.6000} // ~12 km NE
+)
+
+// newTestPosWithFences wires a PositionUsecase with the fence lookup
+// option enabled. Returns the usecase + every mock so tests can drive
+// inputs and inspect the captured alerts.
+func newTestPosWithFences(t *testing.T, now time.Time) (
+	*PositionUsecase,
+	*memPositionRepo,
+	*memVehicleLookup,
+	*memGeofenceLookup,
+	*spyPublisher,
+) {
+	t.Helper()
+	repo := newMemPositionRepo()
+	vehicles := newMemVehicleLookup()
+	fences := newMemGeofenceLookup()
+	pub := newSpyPublisher()
+	uc, err := NewPositionUsecase(repo, vehicles, pub, WithGeofences(fences))
+	if err != nil {
+		t.Fatalf("NewPositionUsecase: %v", err)
+	}
+	uc.now = fixedNow(now)
+	return uc, repo, vehicles, fences, pub
+}
+
+// writeAt is a tiny helper that wraps the usecase Write call with a
+// pinned lat/lng, leaving the speed/freshness fields to their defaults.
+// Tests use it to push the next reading at one of the canonical
+// inside/outside coordinates.
+func writeAt(
+	t *testing.T,
+	uc *PositionUsecase,
+	vehicleID, driverID string,
+	lat, lng float64,
+	recordedAt int64,
+) *domain.Position {
+	t.Helper()
+	p, err := uc.Write(context.Background(), driverID, WritePositionInput{
+		VehicleID:  vehicleID,
+		Lat:        lat,
+		Lng:        lng,
+		SpeedKmh:   25.0,
+		RecordedAt: recordedAt,
+	})
+	if err != nil {
+		t.Fatalf("Write(%f,%f): %v", lat, lng, err)
+	}
+	return p
+}
+
+func TestWrite_Geofence_NoFenceConfigured(t *testing.T) {
+	// No fence Set() on the lookup → GetByVehicle returns ErrNotFound
+	// → silently skipped. The position write still succeeds and only
+	// the position.update event is emitted.
+	now := time.Unix(1_700_000_000, 0)
+	uc, _, vehicles, _, pub := newTestPosWithFences(t, now)
+	vehicles.Set("veh_1", "drv_1")
+
+	writeAt(t, uc, "veh_1", "drv_1", insidePoint.lat, insidePoint.lng, now.UnixMilli())
+	writeAt(t, uc, "veh_1", "drv_1", outsidePoint.lat, outsidePoint.lng, now.UnixMilli())
+
+	if len(pub.alerts) != 0 {
+		t.Fatalf("no fence configured: expected 0 alerts, got %d (%+v)", len(pub.alerts), pub.alerts)
+	}
+	if len(pub.calls) != 2 {
+		t.Fatalf("expected 2 position.update publishes, got %d", len(pub.calls))
+	}
+}
+
+func TestWrite_Geofence_NoPreviousPosition(t *testing.T) {
+	// First-ever position for the vehicle: GetMostRecentByVehicleBeforeID
+	// returns ErrNotFound → no transition to compare → no alert.
+	now := time.Unix(1_700_000_000, 0)
+	uc, _, vehicles, fences, pub := newTestPosWithFences(t, now)
+	vehicles.Set("veh_1", "drv_1")
+	fences.Set(bangkokFence("veh_1"))
+
+	// Even though the single reading is inside the fence, the first
+	// reading has nothing to transition FROM, so no alert.
+	writeAt(t, uc, "veh_1", "drv_1", insidePoint.lat, insidePoint.lng, now.UnixMilli())
+
+	if len(pub.alerts) != 0 {
+		t.Fatalf("first-ever position: expected 0 alerts, got %d (%+v)", len(pub.alerts), pub.alerts)
+	}
+}
+
+func TestWrite_Geofence_BothInside_NoAlert(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	uc, _, vehicles, fences, pub := newTestPosWithFences(t, now)
+	vehicles.Set("veh_1", "drv_1")
+	fences.Set(bangkokFence("veh_1"))
+
+	writeAt(t, uc, "veh_1", "drv_1", insidePoint.lat, insidePoint.lng, now.UnixMilli())
+	// Slightly different inside point, still well within the fence.
+	writeAt(t, uc, "veh_1", "drv_1", insidePoint.lat+0.0001, insidePoint.lng+0.0001, now.UnixMilli())
+
+	if len(pub.alerts) != 0 {
+		t.Fatalf("both-inside: expected 0 alerts, got %d (%+v)", len(pub.alerts), pub.alerts)
+	}
+}
+
+func TestWrite_Geofence_BothOutside_NoAlert(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	uc, _, vehicles, fences, pub := newTestPosWithFences(t, now)
+	vehicles.Set("veh_1", "drv_1")
+	fences.Set(bangkokFence("veh_1"))
+
+	writeAt(t, uc, "veh_1", "drv_1", outsidePoint.lat, outsidePoint.lng, now.UnixMilli())
+	writeAt(t, uc, "veh_1", "drv_1", outsidePoint.lat+0.001, outsidePoint.lng+0.001, now.UnixMilli())
+
+	if len(pub.alerts) != 0 {
+		t.Fatalf("both-outside: expected 0 alerts, got %d (%+v)", len(pub.alerts), pub.alerts)
+	}
+}
+
+func TestWrite_Geofence_ExitTransition(t *testing.T) {
+	// Previous inside, current outside → alert with type=exit.
+	now := time.Unix(1_700_000_000, 0)
+	uc, _, vehicles, fences, pub := newTestPosWithFences(t, now)
+	vehicles.Set("veh_1", "drv_1")
+	fences.Set(bangkokFence("veh_1"))
+
+	writeAt(t, uc, "veh_1", "drv_1", insidePoint.lat, insidePoint.lng, now.UnixMilli())
+	current := writeAt(t, uc, "veh_1", "drv_1", outsidePoint.lat, outsidePoint.lng, now.UnixMilli())
+
+	if len(pub.alerts) != 1 {
+		t.Fatalf("expected exactly 1 alert, got %d (%+v)", len(pub.alerts), pub.alerts)
+	}
+	alert := pub.alerts[0]
+	if alert.alertType != "exit" {
+		t.Errorf("alert_type: got %q, want exit", alert.alertType)
+	}
+	if alert.vehicleID != "veh_1" {
+		t.Errorf("vehicle_id: got %q, want veh_1", alert.vehicleID)
+	}
+	if alert.at != current.RecordedAt {
+		t.Errorf("at: got %d, want %d (current.RecordedAt)", alert.at, current.RecordedAt)
+	}
+}
+
+func TestWrite_Geofence_EnterTransition(t *testing.T) {
+	// Previous outside, current inside → alert with type=enter.
+	now := time.Unix(1_700_000_000, 0)
+	uc, _, vehicles, fences, pub := newTestPosWithFences(t, now)
+	vehicles.Set("veh_1", "drv_1")
+	fences.Set(bangkokFence("veh_1"))
+
+	writeAt(t, uc, "veh_1", "drv_1", outsidePoint.lat, outsidePoint.lng, now.UnixMilli())
+	current := writeAt(t, uc, "veh_1", "drv_1", insidePoint.lat, insidePoint.lng, now.UnixMilli())
+
+	if len(pub.alerts) != 1 {
+		t.Fatalf("expected exactly 1 alert, got %d (%+v)", len(pub.alerts), pub.alerts)
+	}
+	alert := pub.alerts[0]
+	if alert.alertType != "enter" {
+		t.Errorf("alert_type: got %q, want enter", alert.alertType)
+	}
+	if alert.vehicleID != "veh_1" {
+		t.Errorf("vehicle_id: got %q, want veh_1", alert.vehicleID)
+	}
+	if alert.at != current.RecordedAt {
+		t.Errorf("at: got %d, want %d (current.RecordedAt)", alert.at, current.RecordedAt)
+	}
+}
+
+func TestWrite_Geofence_NilFencesLookup_NoAlert(t *testing.T) {
+	// Usecase wired without WithGeofences → transition-detection
+	// silently skipped. This is the backwards-compatibility path so
+	// existing callers (and the rest of the suite above) keep working.
+	now := time.Unix(1_700_000_000, 0)
+	repo := newMemPositionRepo()
+	vehicles := newMemVehicleLookup()
+	vehicles.Set("veh_1", "drv_1")
+	pub := newSpyPublisher()
+	uc, err := NewPositionUsecase(repo, vehicles, pub) // no WithGeofences
+	if err != nil {
+		t.Fatalf("NewPositionUsecase: %v", err)
+	}
+	uc.now = fixedNow(now)
+
+	writeAt(t, uc, "veh_1", "drv_1", insidePoint.lat, insidePoint.lng, now.UnixMilli())
+	writeAt(t, uc, "veh_1", "drv_1", outsidePoint.lat, outsidePoint.lng, now.UnixMilli())
+
+	if len(pub.alerts) != 0 {
+		t.Fatalf("nil-fences-lookup: expected 0 alerts, got %d", len(pub.alerts))
+	}
+}
+
+func TestWrite_Geofence_AlertPublishFailureDoesNotFailRequest(t *testing.T) {
+	// Best-effort: an alert publish failure must be logged at warn
+	// level but the request still succeeds. The position is already
+	// durably written; the alert is a notification convenience.
+	now := time.Unix(1_700_000_000, 0)
+	uc, _, vehicles, fences, pub := newTestPosWithFences(t, now)
+	vehicles.Set("veh_1", "drv_1")
+	fences.Set(bangkokFence("veh_1"))
+	pub.alertFailWith = errors.New("DO unreachable")
+
+	buf := captureLogs(t)
+
+	writeAt(t, uc, "veh_1", "drv_1", insidePoint.lat, insidePoint.lng, now.UnixMilli())
+	current, err := uc.Write(context.Background(), "drv_1", WritePositionInput{
+		VehicleID:  "veh_1",
+		Lat:        outsidePoint.lat,
+		Lng:        outsidePoint.lng,
+		SpeedKmh:   30,
+		RecordedAt: now.UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("Write must succeed even when alert publish fails: %v", err)
+	}
+	if current == nil || current.ID == 0 {
+		t.Fatal("position must be returned with ID populated")
+	}
+	if len(pub.alerts) != 1 {
+		t.Fatalf("publisher should still be called for the exit transition, got %d alerts", len(pub.alerts))
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "DO unreachable") {
+		t.Errorf("expected warn log to mention underlying error, got: %s", logged)
+	}
+}
+
+func TestWrite_Geofence_FenceLookupInfraError_LogsAndSkips(t *testing.T) {
+	// A non-ErrNotFound error from the fence lookup must be logged at
+	// warn level and the request still succeeds — same best-effort
+	// contract as the alert publish.
+	now := time.Unix(1_700_000_000, 0)
+	uc, _, vehicles, fences, pub := newTestPosWithFences(t, now)
+	vehicles.Set("veh_1", "drv_1")
+	fences.failWith = errors.New("D1 timeout in fence lookup")
+
+	buf := captureLogs(t)
+
+	in := validInput("veh_1", now.UnixMilli())
+	if _, err := uc.Write(context.Background(), "drv_1", in); err != nil {
+		t.Fatalf("fence-lookup failure should not fail request: %v", err)
+	}
+	if len(pub.alerts) != 0 {
+		t.Fatalf("expected 0 alerts on fence-lookup failure, got %d", len(pub.alerts))
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "D1 timeout in fence lookup") {
+		t.Errorf("expected warn log to mention underlying error, got: %s", logged)
 	}
 }

@@ -2,6 +2,7 @@ package d1
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -405,5 +406,125 @@ func TestPositionRepo_ListByVehicleAndRange_NilExecutor(t *testing.T) {
 	_, err := repo.ListByVehicleAndRange(context.Background(), "v", 0, 0, 0)
 	if err == nil {
 		t.Fatal("ListByVehicleAndRange on nil-exec repo should error")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GetMostRecentByVehicleBeforeID — used by the geofence transition-
+// detection step in PositionUsecase. The contract is:
+//
+//   - given a vehicle and an id (the one we just inserted), return the
+//     immediate predecessor for that vehicle (largest id strictly less
+//     than excludeID)
+//   - if no predecessor exists, return domain.ErrNotFound
+//
+// Tests cover: empty store, only-the-given row (first ever), multiple
+// rows (must pick the immediate predecessor, not the oldest), filtering
+// by vehicle (must not return another vehicle's row).
+// ---------------------------------------------------------------------------
+
+func TestPositionRepo_GetMostRecentByVehicleBeforeID_NoPositions(t *testing.T) {
+	exec := freshSchemaForPositions(t)
+	repo := NewPositionRepo(exec)
+
+	_, err := repo.GetMostRecentByVehicleBeforeID(context.Background(), "veh_1", 999)
+	if err == nil {
+		t.Fatal("expected error when no positions exist")
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got: %v", err)
+	}
+}
+
+func TestPositionRepo_GetMostRecentByVehicleBeforeID_OnlyTheExcludedRow(t *testing.T) {
+	// Vehicle has exactly one position. Excluding it leaves no
+	// predecessor → ErrNotFound.
+	exec := freshSchemaForPositions(t)
+	ids := seedPositions(t, exec, "veh_1", 1, 1_700_000_000_000)
+	if len(ids) != 1 {
+		t.Fatalf("expected 1 seeded id, got %d", len(ids))
+	}
+
+	repo := NewPositionRepo(exec)
+	_, err := repo.GetMostRecentByVehicleBeforeID(context.Background(), "veh_1", ids[0])
+	if err == nil {
+		t.Fatal("expected ErrNotFound when only the excluded row exists")
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got: %v", err)
+	}
+}
+
+func TestPositionRepo_GetMostRecentByVehicleBeforeID_PicksImmediatePredecessor(t *testing.T) {
+	// Insert 5 positions; excluding the 4th must return the 3rd, not
+	// the 1st (the test would pass with the wrong implementation if it
+	// returned ANY older row, so we assert on the exact id).
+	exec := freshSchemaForPositions(t)
+	ids := seedPositions(t, exec, "veh_1", 5, 1_700_000_000_000)
+	if len(ids) != 5 {
+		t.Fatalf("expected 5 seeded ids, got %d", len(ids))
+	}
+
+	repo := NewPositionRepo(exec)
+	got, err := repo.GetMostRecentByVehicleBeforeID(context.Background(), "veh_1", ids[3])
+	if err != nil {
+		t.Fatalf("GetMostRecentByVehicleBeforeID: %v", err)
+	}
+	if got.ID != ids[2] {
+		t.Fatalf("expected predecessor id=%d (the 3rd insert), got %d", ids[2], got.ID)
+	}
+}
+
+func TestPositionRepo_GetMostRecentByVehicleBeforeID_FiltersByVehicle(t *testing.T) {
+	// Two vehicles, interleaved inserts. The predecessor of veh_1's
+	// second insert must be veh_1's first insert — not veh_2's, even
+	// though veh_2's was inserted in between.
+	exec := freshSchemaForPositions(t)
+	ctx := context.Background()
+	now := time.Now().UTC().UnixMilli()
+	if err := exec.Exec(ctx,
+		`INSERT INTO vehicles (id, plate_number, model, driver_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		"veh_2", "XYZ-9999", "Sedan", "drv_1", now, now,
+	); err != nil {
+		t.Fatalf("seed second vehicle: %v", err)
+	}
+
+	repo := NewPositionRepo(exec)
+	// veh_1 #1
+	p1 := samplePosition("veh_1")
+	p1.RecordedAt = 1_700_000_000_000
+	if err := repo.Insert(ctx, p1); err != nil {
+		t.Fatalf("insert v1#1: %v", err)
+	}
+	// veh_2 #1
+	p2 := samplePosition("veh_2")
+	p2.RecordedAt = 1_700_000_000_100
+	if err := repo.Insert(ctx, p2); err != nil {
+		t.Fatalf("insert v2#1: %v", err)
+	}
+	// veh_1 #2
+	p3 := samplePosition("veh_1")
+	p3.RecordedAt = 1_700_000_000_200
+	if err := repo.Insert(ctx, p3); err != nil {
+		t.Fatalf("insert v1#2: %v", err)
+	}
+
+	got, err := repo.GetMostRecentByVehicleBeforeID(ctx, "veh_1", p3.ID)
+	if err != nil {
+		t.Fatalf("GetMostRecentByVehicleBeforeID: %v", err)
+	}
+	if got.ID != p1.ID {
+		t.Fatalf("predecessor must be veh_1's earlier row (id=%d), got id=%d", p1.ID, got.ID)
+	}
+	if got.VehicleID != "veh_1" {
+		t.Errorf("predecessor leaked from sibling vehicle: %+v", got)
+	}
+}
+
+func TestPositionRepo_GetMostRecentByVehicleBeforeID_NilExecutor(t *testing.T) {
+	repo := &PositionRepo{}
+	if _, err := repo.GetMostRecentByVehicleBeforeID(context.Background(), "v", 1); err == nil {
+		t.Fatal("GetMostRecentByVehicleBeforeID on nil-exec repo should error")
 	}
 }

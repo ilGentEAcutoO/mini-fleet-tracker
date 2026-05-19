@@ -140,6 +140,57 @@ func scanPositionRows(rows Rows, p *domain.Position) error {
 	return nil
 }
 
+// GetMostRecentByVehicleBeforeID returns the most-recent position for
+// the given vehicle whose id is strictly less than excludeID. Returns
+// domain.ErrNotFound when no such row exists (i.e. excludeID was the
+// vehicle's first ever position, or the vehicle has no positions).
+//
+// Used by the geofence transition-detection step in PositionUsecase:
+// after inserting a new position we ask "what was the prior position
+// for this vehicle?" to decide whether the inside/outside state
+// changed across the two readings. We use id (an auto-increment) as
+// the ordering key rather than recorded_at because:
+//
+//   - id is monotonic by insert order, so "previous" is unambiguous
+//     even when two readings share a recorded_at millisecond
+//   - the usecase always calls this with the id it just got back from
+//     Insert, so we have the exclusive upper bound right there
+//
+// Returns at most one row. The DESC ordering + LIMIT 1 picks the
+// immediate predecessor regardless of how many older rows exist.
+func (r *PositionRepo) GetMostRecentByVehicleBeforeID(
+	ctx context.Context,
+	vehicleID string,
+	excludeID int64,
+) (*domain.Position, error) {
+	if r == nil || r.exec == nil {
+		return nil, errors.New("position repo: nil executor")
+	}
+	rows, err := r.exec.Query(ctx,
+		`SELECT `+positionColumnList+` FROM positions
+		 WHERE vehicle_id = ? AND id < ?
+		 ORDER BY id DESC
+		 LIMIT 1`,
+		vehicleID, excludeID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("position repo: get-previous query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	if !rows.Next() {
+		if iterErr := rows.Err(); iterErr != nil {
+			return nil, fmt.Errorf("position repo: get-previous iterate: %w", iterErr)
+		}
+		return nil, fmt.Errorf("previous position for vehicle %s: %w", vehicleID, domain.ErrNotFound)
+	}
+	var p domain.Position
+	if scanErr := scanPositionRows(rows, &p); scanErr != nil {
+		return nil, fmt.Errorf("position repo: get-previous scan: %w", scanErr)
+	}
+	return &p, nil
+}
+
 // ListByVehicleAndRange returns positions for vehicleID whose recorded_at
 // is in the inclusive range [fromMs, toMs], ordered DESC by recorded_at,
 // limited to `limit` rows.

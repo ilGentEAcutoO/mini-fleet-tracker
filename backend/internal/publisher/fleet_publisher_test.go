@@ -244,6 +244,115 @@ func TestPublishPositionUpdate_UpstreamErrorPropagates(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// PublishGeofenceAlert — TASK-020. Same wire transport (HMAC-signed POST)
+// as PublishPositionUpdate; only the event shape differs.
+// ---------------------------------------------------------------------------
+
+func TestPublishGeofenceAlert_PostsExpectedRequest(t *testing.T) {
+	// Happy path: the event must POST to /internal/publish with a
+	// JSON body the DO would accept as a geofence.alert event.
+	var got captured
+	pub := newTestPublisher(t, func(w http.ResponseWriter, r *http.Request) {
+		got.method = r.Method
+		got.path = r.URL.Path
+		got.contentType = r.Header.Get("Content-Type")
+		got.signature = r.Header.Get("X-Signature")
+		got.body, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	if err := pub.PublishGeofenceAlert(context.Background(), "veh_1", "enter", 1_700_000_000_999); err != nil {
+		t.Fatalf("PublishGeofenceAlert: %v", err)
+	}
+
+	if got.method != http.MethodPost {
+		t.Errorf("method = %q, want POST", got.method)
+	}
+	if got.path != "/internal/publish" {
+		t.Errorf("path = %q, want /internal/publish", got.path)
+	}
+	if got.contentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got.contentType)
+	}
+	if got.signature == "" {
+		t.Error("X-Signature header must be set")
+	}
+
+	// Body must round-trip into the wire-shape struct.
+	var ev geofenceAlertEvent
+	if err := json.Unmarshal(got.body, &ev); err != nil {
+		t.Fatalf("unmarshal body: %v\nbody=%s", err, got.body)
+	}
+	if ev.Type != "geofence.alert" {
+		t.Errorf("type = %q, want geofence.alert", ev.Type)
+	}
+	if ev.VehicleID != "veh_1" {
+		t.Errorf("vehicle_id = %q, want veh_1", ev.VehicleID)
+	}
+	if ev.AlertType != "enter" {
+		t.Errorf("alert_type = %q, want enter", ev.AlertType)
+	}
+	if ev.At != 1_700_000_000_999 {
+		t.Errorf("at = %d, want 1_700_000_000_999", ev.At)
+	}
+}
+
+func TestPublishGeofenceAlert_ExitVariant(t *testing.T) {
+	// Same happy-path shape, but with alert_type=exit. Doubles as a
+	// sanity check that the wire shape preserves the value the caller
+	// passed (i.e. we don't accidentally hard-code "enter" somewhere).
+	var rawBody []byte
+	pub := newTestPublisher(t, func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	if err := pub.PublishGeofenceAlert(context.Background(), "veh_2", "exit", 42); err != nil {
+		t.Fatalf("PublishGeofenceAlert: %v", err)
+	}
+	if !strings.Contains(string(rawBody), `"alert_type":"exit"`) {
+		t.Errorf("body missing alert_type=exit, got: %s", rawBody)
+	}
+}
+
+func TestPublishGeofenceAlert_OmitsExtraFields(t *testing.T) {
+	// The wire envelope must not leak fields the DO doesn't know about.
+	// Only the four documented keys may appear.
+	var rawBody []byte
+	pub := newTestPublisher(t, func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	if err := pub.PublishGeofenceAlert(context.Background(), "veh_1", "enter", 1); err != nil {
+		t.Fatalf("PublishGeofenceAlert: %v", err)
+	}
+	bodyStr := string(rawBody)
+	for _, required := range []string{`"type"`, `"vehicle_id"`, `"alert_type"`, `"at"`} {
+		if !strings.Contains(bodyStr, required) {
+			t.Errorf("body missing required key %s; got: %s", required, bodyStr)
+		}
+	}
+}
+
+func TestPublishGeofenceAlert_UpstreamErrorPropagates(t *testing.T) {
+	// Non-2xx must propagate — same best-effort contract as
+	// position.update so the usecase's warn-on-failure path stays
+	// uniform across event types.
+	pub := newTestPublisher(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "DO blew up")
+	})
+	err := pub.PublishGeofenceAlert(context.Background(), "veh_1", "enter", 1)
+	if err == nil {
+		t.Fatal("500 must propagate as an error")
+	}
+	if errors.Is(err, cfclient.ErrUnauthorized) {
+		t.Errorf("500 must NOT be classified as ErrUnauthorized: %v", err)
+	}
+}
+
 func TestPublishPositionUpdate_ContextCancelled(t *testing.T) {
 	// Cancelling the parent context before the call must surface as an
 	// error — the publisher does NOT swallow cancellations. Important
