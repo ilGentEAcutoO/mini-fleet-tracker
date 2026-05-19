@@ -1,5 +1,10 @@
 // Centralised $fetch wrapper.
 //
+// Lives in `composables/` (not `utils/`) because it is a stateful factory:
+// it reads `useRuntimeConfig()`, mounts request/response hooks, and on SSR
+// reaches into the request context via `useRequestHeaders`. Pure helpers
+// belong in `utils/`; anything that touches Nuxt composables belongs here.
+//
 // Responsibilities:
 //   1. Send credentials (httpOnly session cookie set by the Go API) on every
 //      request — same-origin in prod, dev relies on the CORS_ORIGIN config in
