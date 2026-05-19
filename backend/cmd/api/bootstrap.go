@@ -14,6 +14,7 @@ import (
 	"github.com/ilGentEAcutoO/mini-fleet-tracker/backend/internal/config"
 	"github.com/ilGentEAcutoO/mini-fleet-tracker/backend/internal/handler"
 	"github.com/ilGentEAcutoO/mini-fleet-tracker/backend/internal/middleware"
+	"github.com/ilGentEAcutoO/mini-fleet-tracker/backend/internal/publisher"
 	d1repo "github.com/ilGentEAcutoO/mini-fleet-tracker/backend/internal/repository/d1"
 	"github.com/ilGentEAcutoO/mini-fleet-tracker/backend/internal/usecase"
 	"github.com/ilGentEAcutoO/mini-fleet-tracker/backend/pkg/cfclient"
@@ -124,11 +125,39 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 		return nil, cleanup, fmt.Errorf("setup: vehicle usecase: %w", err)
 	}
 
-	// PositionUsecase uses NoopPublisher until TASK-014 wires the real
-	// Durable Object client. Positions are still durably persisted to D1;
-	// only the WS broadcast is deferred.
+	// PositionUsecase needs an EventPublisher to broadcast position.update
+	// events to the FleetHub Durable Object. The production wiring is the
+	// HMAC-signed POST handled by cfclient.DurableClient + publisher.New.
+	//
+	// Dev-environment fallback: when DO_PUBLISH_URL is unset AND we're in
+	// development, fall back to NoopPublisher so `go run ./cmd/api` boots
+	// without secrets. Positions are still durably persisted to D1; only
+	// the WS broadcast is silently dropped. Mirrors the same allow-empty
+	// pattern kvQuotas uses just above — fail-fast in prod, degrade
+	// gracefully in dev so local hacking does not require a real Worker.
+	var positionEventPublisher usecase.EventPublisher
+	if cfg.DOPublishURL == "" && cfg.IsDevelopment() {
+		log.Warn().Msg("DO_PUBLISH_URL not set; using NoopPublisher (positions will not broadcast to FleetHub)")
+		positionEventPublisher = usecase.NoopPublisher{}
+	} else {
+		var doClient *cfclient.DurableClient
+		doClient, err = cfclient.NewDurableClient(cfclient.DurableConfig{
+			PublishURL: cfg.DOPublishURL,
+			Secret:     cfg.InternalPublishSecret,
+		})
+		if err != nil {
+			return nil, cleanup, fmt.Errorf("setup: durable client: %w", err)
+		}
+		var fleetPub *publisher.FleetPublisher
+		fleetPub, err = publisher.New(doClient)
+		if err != nil {
+			return nil, cleanup, fmt.Errorf("setup: fleet publisher: %w", err)
+		}
+		positionEventPublisher = fleetPub
+	}
+
 	positionRepo := d1repo.NewPositionRepo(d1Client)
-	positionUC, err := usecase.NewPositionUsecase(positionRepo, vehicleRepo, usecase.NoopPublisher{})
+	positionUC, err := usecase.NewPositionUsecase(positionRepo, vehicleRepo, positionEventPublisher)
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("setup: position usecase: %w", err)
 	}
@@ -273,8 +302,9 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	vehicles.Delete("/:id", csrfMW, vehicleHandler.Delete)
 
 	// Position writes — driver-only enforcement in the handler; per-user
-	// rate limit on top of the global umbrella. NoopPublisher is wired in
-	// the usecase; TASK-014 swaps in the real Durable Object client.
+	// rate limit on top of the global umbrella. The position usecase
+	// publishes a position.update event to the FleetHub DO after a
+	// successful save (best-effort; D1 is the source of truth).
 	api.Post("/positions", authMW, csrfMW, positionRL, positionHandler.Write)
 
 	return app, cleanup, nil
