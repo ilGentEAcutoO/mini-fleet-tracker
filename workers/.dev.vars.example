@@ -1,0 +1,8 @@
+# Wrangler reads .dev.vars (NOT .env) for local dev. Keep names in sync with backend.
+# In prod, use `wrangler secret put` instead.
+
+# Must match backend/.env JWT_SECRET exactly (shared HS256 signing key)
+JWT_SECRET=replace-with-same-32-byte-random-hex-as-backend
+
+# Must match backend/.env INTERNAL_PUBLISH_SECRET exactly
+INTERNAL_PUBLISH_SECRET=replace-with-same-shared-secret-as-backend

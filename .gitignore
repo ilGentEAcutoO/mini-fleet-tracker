@@ -1,0 +1,37 @@
+# --- Secrets & env files ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# --- Node / Nuxt ---
+node_modules/
+dist/
+build/
+.nuxt/
+.output/
+.data/
+
+# --- Go ---
+*.exe
+*.test
+*.out
+vendor/
+
+# --- Cloudflare Wrangler ---
+.wrangler/
+
+# --- Logs & temp ---
+*.log
+tmp/
+agent-temp/
+
+# --- Coverage ---
+coverage/
+
+# --- Editors / OS ---
+.DS_Store
+.vscode/
+.idea/
