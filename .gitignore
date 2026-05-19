@@ -27,6 +27,8 @@ vendor/
 *.log
 tmp/
 agent-temp/
+.gocache/
+.gomodcache/
 
 # --- Coverage ---
 coverage/
