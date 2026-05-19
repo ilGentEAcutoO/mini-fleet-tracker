@@ -16,11 +16,10 @@ name = "FLEET_HUB"
 class_name = "FleetHub"
 script_name = "fleet-do-hub"
 
-# Production routes are configured in TASK-024 (deploy phase).
-# routes = [
-#   { pattern = "fleet-tracker.jairukchan.com/api/*", zone_name = "jairukchan.com" },
-#   { pattern = "fleet-tracker.jairukchan.com/ws/*",  zone_name = "jairukchan.com" },
-# ]
+routes = [
+  { pattern = "fleet-tracker.jairukchan.com/api/*", zone_name = "jairukchan.com" },
+  { pattern = "fleet-tracker.jairukchan.com/ws/*",  zone_name = "jairukchan.com" },
+]
 
 # Service binding to the fleet-api Container Worker — intra-CF, no DNS
 # hop, no loop-detection 404 that workers.dev URLs get when fetched from

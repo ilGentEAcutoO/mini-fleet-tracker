@@ -1,0 +1,35 @@
+# fleet-frontend — the Nuxt 4 SSR Worker.
+#
+# Nuxt's `nitro: { preset: 'cloudflare_module' }` emits the runtime here:
+#   .output/server/index.mjs  — Worker entry
+#   .output/public/           — static assets
+#
+# Wrangler picks both up via `main` + `[assets]`. The deploy command is
+# the bare `wrangler deploy` from this directory after `pnpm build`.
+#
+# Single-origin deployment: production puts this Worker at
+# fleet-tracker.jairukchan.com/* (catch-all, lowest specificity); the
+# gateway Worker's /api/* and /ws/* routes win by specificity. Same-
+# origin means SameSite=Lax cookies work without CORS gymnastics.
+name = "fleet-frontend"
+main = ".output/server/index.mjs"
+compatibility_date = "2026-05-19"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = ".output/public"
+binding = "ASSETS"
+
+# Frontend catches everything under the apex subdomain that isn't /api/* or
+# /ws/* (which the gateway claims by higher specificity). zone_name lets
+# Wrangler auto-provision the proxied DNS record on first deploy.
+routes = [
+  { pattern = "fleet-tracker.jairukchan.com/*", zone_name = "jairukchan.com" },
+]
+
+[vars]
+# Same-origin URLs (production) — set after DNS lands on the
+# jairukchan.com zone. Until then, dev points at workers.dev URLs.
+NUXT_PUBLIC_API_BASE = "https://fleet-tracker.jairukchan.com/api"
+NUXT_PUBLIC_WS_BASE = "wss://fleet-tracker.jairukchan.com/ws"
+NUXT_PUBLIC_MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty"
