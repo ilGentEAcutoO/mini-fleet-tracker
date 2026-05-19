@@ -18,8 +18,15 @@
 
 const CSP_HEADER =
   "default-src 'self'; " +
-  "script-src 'self' https://maps.googleapis.com; " +
-  "connect-src 'self' wss://fleet-tracker.jairukchan.com https://maps.googleapis.com; " +
+  "script-src 'self'; " +
+  // OpenFreeMap serves vector tile fragments + the style JSON from these
+  // origins. MapLibre's WebGL renderer reaches them via fetch from the
+  // browser, so connect-src must allow them. wss is the FleetHub upgrade.
+  "connect-src 'self' wss://fleet-tracker.jairukchan.com https://tiles.openfreemap.org; " +
+  // worker-src 'self' covers MapLibre's web worker (decodes vector tiles
+  // off the main thread); blob: is the canonical pattern for libs that
+  // spin up workers from generated blob URLs at runtime.
+  "worker-src 'self' blob:; " +
   "img-src 'self' data: https:; " +
   "style-src 'self' 'unsafe-inline'; " +
   "frame-ancestors 'none'; " +

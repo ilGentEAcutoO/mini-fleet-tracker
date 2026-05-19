@@ -1,38 +1,34 @@
 <script setup lang="ts">
 // Live-tracking map.
 //
-// Wraps the Google Maps JS SDK in a <ClientOnly> because the SDK touches
-// `document` / `window` and would crash during Nuxt's SSR pass otherwise.
+// Wraps MapLibre GL JS in a <ClientOnly> because the SDK touches
+// `document` / `window` and would crash during Nuxt's SSR pass. Tiles
+// come from OpenFreeMap (free vector tiles, no API key, attribution
+// baked into the style). The style URL is overridable via
+// NUXT_PUBLIC_MAP_STYLE for projects that want to point at their own
+// tile server.
 //
-// The component owns ONE map instance and ONE marker per vehicle. When the
-// `positions` prop updates (eg from a WebSocket tick in TASK-016), we
-// "upsert" markers instead of recreating them — recreating triggers a DOM
-// teardown/build that visibly flickers when ticks land at multiple Hz. The
-// upsert path just nudges `marker.position`, which the SDK animates
-// internally without rebuilding the marker element.
-//
-// AdvancedMarkerElement requires a `mapId` (Google's vector renderer). We
-// read it from runtime config; if it's missing we still render the map (the
-// AdvancedMarker class falls back to a console warning, not a crash, but
-// pins render with the legacy style).
+// The component owns ONE map instance and ONE marker per vehicle. When
+// the `positions` prop updates (eg from a WebSocket tick in TASK-016),
+// we "upsert" markers — `marker.setLngLat(...)` nudges the DOM element
+// in place instead of recreating it, so high-frequency ticks don't
+// flicker.
 //
 // TASK-018 added an optional `path` prop for the history view. When
-// supplied, the component renders a single Polyline through the points in
-// order (the parent is responsible for chronological sorting — the
-// backend returns DESC by recorded_at). The Polyline instance is reused
-// across prop changes (setPath, not recreate) for the same flicker-free
-// reason the markers do.
-
+// supplied, we render a single LineString GeoJSON source + line layer.
+// Updates set new data on the source (no layer rebuild) — same flicker-
+// free reasoning as the markers.
 import type { Position } from '~~/shared/types/domain'
+import type { Map as MlMap, Marker as MlMarker } from 'maplibre-gl'
 
 interface Props {
-  // vehicle_id → latest position. A Map (not a plain object) so consumers can
-  // call `.set(id, pos)` to upsert without a deep clone, and so we can iterate
-  // entries in insertion order to keep z-order stable across renders.
+  // vehicle_id → latest position. A Map (not a plain object) so consumers
+  // can call `.set(id, pos)` to upsert without a deep clone, and so we
+  // iterate entries in insertion order to keep z-order stable.
   positions: Map<string, Position>
-  // Optional ordered path. When non-empty, MapView draws a Polyline through
-  // these points (in order). Pass `undefined` (or omit) to skip the
-  // polyline entirely — the live dashboard does not use this.
+  // Optional ordered path. When non-empty, MapView draws a polyline
+  // through these points (in order). Pass `undefined` (or omit) to skip
+  // the polyline entirely — the live dashboard does not use this.
   path?: Position[]
   center?: { lat: number; lng: number }
   zoom?: number
@@ -41,170 +37,157 @@ interface Props {
 
 const props = withDefaults(defineProps<Props>(), {
   path: () => [],
-  // Bangkok — chosen because the demo dataset is Bangkok-flavoured and the
-  // dashboard's initial empty state should look intentional, not "lost at
-  // coordinate 0,0 in the Atlantic".
+  // Bangkok — the demo dataset is Bangkok-flavoured and the dashboard's
+  // initial empty state should look intentional, not "lost at 0,0 in
+  // the Atlantic".
   center: () => ({ lat: 13.7563, lng: 100.5018 }),
   zoom: 12,
   className: 'h-[500px] w-full',
 })
 
-const config = useRuntimeConfig()
-const { load } = useGoogleMaps()
+const { ns, styleUrl } = useMaplibre()
 
 const mapEl = ref<HTMLElement | null>(null)
-// shallowRef because google.maps.Map is a deeply non-reactive SDK object —
-// wrapping it in a normal ref makes Vue try to proxy every internal field
-// and triggers SDK warnings about frozen prototypes.
-const map = shallowRef<google.maps.Map | null>(null)
-const markers = new Map<string, google.maps.marker.AdvancedMarkerElement>()
-// Single reusable Polyline instance for the history-view path. shallowRef
-// for the same reason as `map` — the SDK object is intentionally opaque.
-const polyline = shallowRef<google.maps.Polyline | null>(null)
+// shallowRef because MapLibre Map is a deeply non-reactive SDK object —
+// wrapping it in a normal ref makes Vue try to proxy every internal
+// field and would burn CPU on every render tick.
+const map = shallowRef<MlMap | null>(null)
+const markers = new Map<string, MlMarker>()
 const error = ref<string | null>(null)
+// styleLoaded flips true on the map's 'load' event; we defer source
+// + layer registration until then so addSource / addLayer don't throw.
+const styleLoaded = ref(false)
 
-onMounted(async () => {
+const PATH_SOURCE_ID = 'fleet-history-path'
+const PATH_LAYER_ID = 'fleet-history-line'
+
+onMounted(() => {
+  if (!mapEl.value) return
   try {
-    await load()
-    const { Map: GMap } = (await google.maps.importLibrary(
-      'maps',
-    )) as google.maps.MapsLibrary
-    if (!mapEl.value) return
-
-    map.value = new GMap(mapEl.value, {
-      center: props.center,
+    map.value = new ns.Map({
+      container: mapEl.value,
+      style: styleUrl,
+      center: [props.center.lng, props.center.lat],
       zoom: props.zoom,
-      // mapId is REQUIRED for AdvancedMarkerElement to render in vector mode.
-      // If the env var is empty/undefined we pass `undefined` (not '') so the
-      // SDK's default fallback path engages cleanly.
-      mapId: config.public.mapId || undefined,
-      disableDefaultUI: false,
-      mapTypeControl: false,
-      streetViewControl: false,
+      attributionControl: { compact: true },
     })
-
-    // Initial render with whatever positions the parent already has.
-    await syncMarkers()
-    // Initial path render. Cheap when path is empty — the function
-    // short-circuits before reaching for the SDK library.
-    await syncPath()
+    map.value.on('load', () => {
+      styleLoaded.value = true
+      syncMarkers()
+      syncPath()
+    })
+    map.value.on('error', (e) => {
+      error.value = e?.error?.message ?? 'Map error'
+    })
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : 'Failed to load map'
   }
 })
 
-// Watch the entries — the prop is a Map, and Vue's deep-watch on Map keys is
-// fine here. We deliberately watch the values array (cheap to derive) rather
-// than the Map itself so the callback fires reliably even when callers mutate
-// in place (`positions.set(id, pos)`) AND when they assign a new Map.
+// Watch the entries — Vue's deep-watch on Map keys is fine here. We
+// derive the values array so the callback fires whether callers mutate
+// in place (`positions.set(id, pos)`) or assign a new Map.
 watch(
   () => Array.from(props.positions.values()),
-  () => {
-    if (map.value) void syncMarkers()
-  },
+  () => syncMarkers(),
   { deep: false },
 )
 
-// Watch the path. We trigger on length + first/last identity so swapping
-// out the array reference always fires, but a parent that pushes the same
-// reference unchanged doesn't pay for a redundant SDK round-trip. Path
-// equality of arrays in Vue would require a deep watcher, which is more
-// expensive than needed here — we already get fresh prop updates whenever
-// the parent reassigns the prop.
 watch(
   () => props.path,
-  () => {
-    if (map.value) void syncPath()
-  },
+  () => syncPath(),
   { deep: false },
 )
 
-async function syncMarkers() {
-  if (!map.value) return
-  const { AdvancedMarkerElement } = (await google.maps.importLibrary(
-    'marker',
-  )) as google.maps.MarkerLibrary
+function syncMarkers() {
+  const m = map.value
+  if (!m || !styleLoaded.value) return
 
   const seen = new Set<string>()
   for (const [vehicleId, pos] of props.positions.entries()) {
     seen.add(vehicleId)
     const existing = markers.get(vehicleId)
     if (!existing) {
-      const marker = new AdvancedMarkerElement({
-        map: map.value,
-        position: { lat: pos.lat, lng: pos.lng },
-        title: vehicleId,
-      })
+      const marker = new ns.Marker({ color: '#2563eb' })
+        .setLngLat([pos.lng, pos.lat])
+        .addTo(m)
+      // Optional tooltip via popup; left as no-op here so the live
+      // dashboard stays uncluttered. Hovering shows the marker only.
+      marker.getElement().title = vehicleId
       markers.set(vehicleId, marker)
     } else {
-      // Upsert: reuse the marker, only nudge its position. The SDK animates
-      // the transition internally so high-frequency ticks don't flicker.
-      existing.position = { lat: pos.lat, lng: pos.lng }
+      // Upsert: nudge the existing marker without rebuilding the DOM.
+      existing.setLngLat([pos.lng, pos.lat])
     }
   }
 
-  // Reap markers for vehicles that disappeared (eg deleted, or filter
-  // narrowed the fleet). Setting `marker.map = null` detaches it from the
-  // map; we then drop the reference so the marker can be GC'd.
+  // Reap markers for vehicles that disappeared.
   for (const [vehicleId, marker] of markers.entries()) {
     if (!seen.has(vehicleId)) {
-      marker.map = null
+      marker.remove()
       markers.delete(vehicleId)
     }
   }
 }
 
-// syncPath reconciles the Polyline instance with `props.path`. When the
-// path is empty we tear down any existing polyline so the map view goes
-// clean. When the path is non-empty we reuse the existing polyline (just
-// call setPath) to avoid the SDK's create/destroy cost — a 1000-vertex
-// polyline takes a noticeable beat to instantiate on a cold map.
-async function syncPath() {
-  if (!map.value) return
+// syncPath reconciles the polyline source data with `props.path`. We
+// add the source + layer once (lazy on first non-empty path); on
+// subsequent updates we call setData which only updates the GeoJSON,
+// not the layer.
+function syncPath() {
+  const m = map.value
+  if (!m || !styleLoaded.value) return
+
   const path = props.path
-  if (!path || path.length === 0) {
-    if (polyline.value) {
-      polyline.value.setMap(null)
-      polyline.value = null
+  const hasPath = !!path && path.length > 1
+  const sourceExists = !!m.getSource(PATH_SOURCE_ID)
+
+  if (!hasPath) {
+    if (sourceExists) {
+      if (m.getLayer(PATH_LAYER_ID)) m.removeLayer(PATH_LAYER_ID)
+      m.removeSource(PATH_SOURCE_ID)
     }
     return
   }
-  // Polyline lives in the `maps` library (same as the Map constructor), so
-  // this importLibrary call is a hot-cache hit after onMounted — no extra
-  // network round trip.
-  const { Polyline } = (await google.maps.importLibrary(
-    'maps',
-  )) as google.maps.MapsLibrary
-  const coords = path.map(p => ({ lat: p.lat, lng: p.lng }))
-  if (!polyline.value) {
-    polyline.value = new Polyline({
-      map: map.value,
-      path: coords,
-      // A clear, fleet-blue line — visible against the default roadmap
-      // tiles without competing with the live marker dots. strokeWeight 3
-      // is the sweet spot: thin enough not to obscure the route detail,
-      // thick enough to read on a phone at zoom 12.
-      strokeColor: '#2563eb',
-      strokeOpacity: 0.85,
-      strokeWeight: 3,
-      geodesic: true,
-    })
+
+  const geojson: GeoJSON.Feature<GeoJSON.LineString> = {
+    type: 'Feature',
+    geometry: {
+      type: 'LineString',
+      coordinates: path.map(p => [p.lng, p.lat]),
+    },
+    properties: {},
   }
-  else {
-    polyline.value.setPath(coords)
+
+  if (sourceExists) {
+    const src = m.getSource(PATH_SOURCE_ID) as maplibregl.GeoJSONSource
+    src.setData(geojson)
+    return
   }
+
+  m.addSource(PATH_SOURCE_ID, { type: 'geojson', data: geojson })
+  m.addLayer({
+    id: PATH_LAYER_ID,
+    type: 'line',
+    source: PATH_SOURCE_ID,
+    layout: { 'line-join': 'round', 'line-cap': 'round' },
+    // Fleet blue — visible against OpenFreeMap's liberty style without
+    // competing with the live marker dots.
+    paint: {
+      'line-color': '#2563eb',
+      'line-width': 3,
+      'line-opacity': 0.85,
+    },
+  })
 }
 
 onBeforeUnmount(() => {
-  for (const marker of markers.values()) {
-    marker.map = null
-  }
+  for (const marker of markers.values()) marker.remove()
   markers.clear()
-  if (polyline.value) {
-    polyline.value.setMap(null)
-    polyline.value = null
+  if (map.value) {
+    map.value.remove()
+    map.value = null
   }
-  map.value = null
 })
 </script>
 

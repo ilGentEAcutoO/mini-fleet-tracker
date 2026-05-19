@@ -14,7 +14,6 @@
     "format": "prettier --write ."
   },
   "dependencies": {
-    "@googlemaps/js-api-loader": "^2.0.2",
     "@pinia/nuxt": "^0.11.3",
     "@tailwindcss/vite": "^4.3.0",
     "@tanstack/vue-table": "^8.21.3",
@@ -23,6 +22,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-vue-next": "^1.0.0",
+    "maplibre-gl": "^5.24.0",
     "nuxt": "^4.4.6",
     "pinia": "^3.0.4",
     "reka-ui": "^2.9.7",
@@ -40,7 +40,6 @@
   "devDependencies": {
     "@nuxt/eslint": "^1.15.2",
     "@nuxt/eslint-config": "^1.15.2",
-    "@types/google.maps": "^3.64.1",
     "@types/node": "^22.10.5",
     "eslint": "^10.4.0",
     "prettier": "^3.8.3",

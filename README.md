@@ -84,7 +84,7 @@ One hostname — `fleet-tracker.jairukchan.com` — fronts everything. The gatew
 - Nuxt 4 + Vue 3 + TypeScript strict
 - `shadcn-vue` (`shadcn-nuxt` module), Tailwind v4, Pinia
 - `vee-validate` + `zod` for form validation
-- `@googlemaps/js-api-loader` with `AdvancedMarkerElement`
+- `maplibre-gl` + OpenFreeMap vector tiles (no API key, no rate limit)
 - Native WebSocket via VueUse `useWebSocket`
 
 **Cloudflare services**

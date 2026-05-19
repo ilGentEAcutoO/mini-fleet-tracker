@@ -9,15 +9,8 @@ export default defineNuxtConfig({
   typescript: {
     strict: true,
     typeCheck: true,
-    // Nuxt sets `types: []` in the generated tsconfig to disable automatic
-    // @types/* discovery; we opt `google.maps` back in so the `google` global
-    // namespace is visible inside MapView.vue / useGoogleMaps.ts without each
-    // file needing a triple-slash reference (.vue files can't host those).
-    tsConfig: {
-      compilerOptions: {
-        types: ['google.maps'],
-      },
-    },
+    // MapLibre ships its own types via the published package so no
+    // additional `types: [...]` opt-in is needed here.
   },
 
   modules: ['@pinia/nuxt', 'shadcn-nuxt', '@nuxt/eslint'],
@@ -51,8 +44,8 @@ export default defineNuxtConfig({
       // Populated from NUXT_PUBLIC_* env vars at runtime.
       apiBase: '',
       wsBase: '',
-      googleMapsKey: '',
-      mapId: '',
+      // OpenFreeMap vector style — overridable via NUXT_PUBLIC_MAP_STYLE.
+      mapStyle: 'https://tiles.openfreemap.org/styles/liberty',
     },
   },
 })

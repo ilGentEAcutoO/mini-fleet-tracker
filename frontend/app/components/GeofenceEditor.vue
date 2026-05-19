@@ -3,29 +3,27 @@
 //
 // Self-contained editor for a single vehicle's circular geofence. Renders
 // three numeric inputs (center lat/lng + radius m), a save button, and a
-// preview map with a google.maps.Circle synced to the form. The "Use map
-// center" button copies the map's current pan position into the form, which
-// is the fastest way to place a fence over a chosen Bangkok neighbourhood
-// without typing six decimal digits.
+// preview map with a polygon approximating the configured circle. The
+// "Use map center" button copies the map's current pan position into the
+// form — the fastest way to place a fence over a chosen Bangkok
+// neighbourhood without typing six decimal digits.
 //
 // Lifecycle
 //
 //   onMounted     → fetchFence (GET, may 404 → empty state), then setupMap
-//                   (load Maps SDK + instantiate map + initial circle)
-//   onBeforeUnmount → detach circle, drop map ref so the SDK GC's cleanly
+//                   (instantiate MapLibre map + initial polygon)
+//   onBeforeUnmount → remove() the map; the SDK detaches everything
 //
 // API contract (manager-only, CSRF on PUT via useApi):
 //   GET /api/vehicles/:id/geofence → 200 { geofence } | 404 if unset
 //   PUT /api/vehicles/:id/geofence → 200 { geofence }
 //
-// Maps SDK note
+// MapLibre note
 //
-//   google.maps.Circle is part of the `maps` library (same import as Map +
-//   Polyline). Loading `maps` once via useGoogleMaps().load() is enough —
-//   the importLibrary call inside setupMap is a hot-cache hit. Circle is
-//   the legacy class (still supported in `weekly`); AdvancedMarkerElement
-//   does not have a circle equivalent in 2026-05, so the legacy class is
-//   the correct choice here.
+//   MapLibre has no first-class Circle primitive. We approximate the
+//   geofence with a 64-point GeoJSON polygon via circlePolygon() (helper
+//   lives in useMaplibre.ts). The approximation is visually identical
+//   for fences ≤ 50 km — the backend validation cap.
 //
 // Validation
 //
@@ -34,8 +32,8 @@
 //   Client-side validation is a UX nicety; the backend re-validates and
 //   returns 400 if these are violated. We surface the client message
 //   directly to avoid a network round-trip for obvious typos.
-
 import { toast } from 'vue-sonner'
+import type { Map as MlMap } from 'maplibre-gl'
 import type { Geofence } from '~~/shared/types/domain'
 
 interface Props {
@@ -45,7 +43,7 @@ interface Props {
 const props = defineProps<Props>()
 
 const api = useApi()
-const { load } = useGoogleMaps()
+const { ns, styleUrl } = useMaplibre()
 
 const fence = ref<Geofence | null>(null)
 // Bangkok defaults — match MapView.vue's empty-state center so an
@@ -58,11 +56,12 @@ const saving = ref(false)
 const error = ref<string | null>(null)
 
 const mapEl = ref<HTMLElement | null>(null)
-// shallowRef for the SDK objects — same reasoning as MapView.vue: the SDK's
-// internal state is intentionally opaque and Vue's deep proxy would warn
-// about frozen prototypes if we used a plain ref.
-const map = shallowRef<google.maps.Map | null>(null)
-const circle = shallowRef<google.maps.Circle | null>(null)
+const map = shallowRef<MlMap | null>(null)
+const styleLoaded = ref(false)
+
+const FENCE_SOURCE_ID = 'fleet-fence-circle'
+const FENCE_FILL_LAYER_ID = 'fleet-fence-fill'
+const FENCE_STROKE_LAYER_ID = 'fleet-fence-stroke'
 
 async function fetchFence(): Promise<void> {
   loading.value = true
@@ -132,85 +131,92 @@ async function save(): Promise<void> {
 }
 
 // Copy the map's current pan position into the form. Useful when the
-// manager has already dragged the map to the area they want fenced — one
-// click avoids typing two six-decimal coordinates.
+// manager has already dragged the map to the area they want fenced.
 function useCurrentMapCenter(): void {
   if (!map.value) return
   const c = map.value.getCenter()
-  if (!c) return
-  centerLat.value = c.lat()
-  centerLng.value = c.lng()
+  centerLat.value = c.lat
+  centerLng.value = c.lng
 }
 
-async function setupMap(): Promise<void> {
+function setupMap(): void {
   if (!mapEl.value) return
   try {
-    await load()
-    const { Map: GMap } = (await google.maps.importLibrary(
-      'maps',
-    )) as google.maps.MapsLibrary
-    map.value = new GMap(mapEl.value, {
-      center: { lat: centerLat.value, lng: centerLng.value },
+    map.value = new ns.Map({
+      container: mapEl.value,
+      style: styleUrl,
+      center: [centerLng.value, centerLat.value],
       zoom: 14,
-      disableDefaultUI: false,
-      mapTypeControl: false,
-      streetViewControl: false,
+      attributionControl: { compact: true },
     })
-    await syncCircle()
+    map.value.on('load', () => {
+      styleLoaded.value = true
+      syncCircle()
+    })
+    map.value.on('error', (e) => {
+      error.value = e?.error?.message ?? 'Map error'
+    })
   }
   catch (err: unknown) {
     error.value = err instanceof Error ? err.message : 'Failed to load map'
   }
 }
 
-// Reuse the same Circle instance across form edits — setCenter / setRadius
-// are O(1) on the SDK side, whereas constructing a fresh Circle each time
-// re-rasterises the fill on the next frame.
-async function syncCircle(): Promise<void> {
-  if (!map.value) return
-  const { Circle } = (await google.maps.importLibrary(
-    'maps',
-  )) as google.maps.MapsLibrary
-  if (!circle.value) {
-    circle.value = new Circle({
-      map: map.value,
-      center: { lat: centerLat.value, lng: centerLng.value },
-      radius: radiusM.value,
+// Reuse the same source/layers across form edits — setData on the
+// source is O(1), whereas rebuilding the layer would re-rasterise the
+// fill on the next frame.
+function syncCircle(): void {
+  const m = map.value
+  if (!m || !styleLoaded.value) return
+
+  const polygon = circlePolygon(
+    { lat: centerLat.value, lng: centerLng.value },
+    radiusM.value,
+  )
+
+  if (m.getSource(FENCE_SOURCE_ID)) {
+    const src = m.getSource(FENCE_SOURCE_ID) as maplibregl.GeoJSONSource
+    src.setData(polygon)
+    return
+  }
+
+  m.addSource(FENCE_SOURCE_ID, { type: 'geojson', data: polygon })
+  m.addLayer({
+    id: FENCE_FILL_LAYER_ID,
+    type: 'fill',
+    source: FENCE_SOURCE_ID,
+    paint: {
       // Same blue as the history polyline (MapView.vue) for visual
       // consistency. 12% fill opacity keeps the underlying tiles readable.
-      strokeColor: '#2563eb',
-      strokeOpacity: 0.85,
-      strokeWeight: 2,
-      fillColor: '#2563eb',
-      fillOpacity: 0.12,
-    })
-  }
-  else {
-    circle.value.setCenter({ lat: centerLat.value, lng: centerLng.value })
-    circle.value.setRadius(radiusM.value)
-  }
+      'fill-color': '#2563eb',
+      'fill-opacity': 0.12,
+    },
+  })
+  m.addLayer({
+    id: FENCE_STROKE_LAYER_ID,
+    type: 'line',
+    source: FENCE_SOURCE_ID,
+    paint: {
+      'line-color': '#2563eb',
+      'line-width': 2,
+      'line-opacity': 0.85,
+    },
+  })
 }
 
-// Cheap to watch each scalar separately — Vue batches three watcher fires
-// into one tick anyway, and the body is idempotent.
-watch([centerLat, centerLng, radiusM], () => {
-  if (map.value) void syncCircle()
-})
+watch([centerLat, centerLng, radiusM], () => syncCircle())
 
 onMounted(async () => {
   await fetchFence()
-  // Wait one tick so <ClientOnly>'s default slot has rendered the mapEl
-  // ref before we try to attach a Map to it.
   await nextTick()
-  await setupMap()
+  setupMap()
 })
 
 onBeforeUnmount(() => {
-  if (circle.value) {
-    circle.value.setMap(null)
-    circle.value = null
+  if (map.value) {
+    map.value.remove()
+    map.value = null
   }
-  map.value = null
 })
 </script>
 
@@ -221,83 +227,48 @@ onBeforeUnmount(() => {
         Geofence
       </CardTitle>
       <CardDescription>
-        Circular boundary; entering or leaving fires a live alert to managers.
+        Circular boundary; entering / leaving fires a live alert to managers.
       </CardDescription>
     </CardHeader>
     <CardContent class="space-y-3">
-      <p v-if="loading" class="text-sm text-muted-foreground">
+      <div v-if="loading" class="text-sm text-muted-foreground">
         Loading…
-      </p>
+      </div>
       <template v-else>
-        <p
-          v-if="!fence"
-          class="text-sm text-muted-foreground"
-        >
+        <p v-if="!fence" class="text-sm text-muted-foreground">
           No geofence configured yet.
         </p>
 
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <div class="space-y-1">
+          <div>
             <Label for="fence-lat">Center latitude</Label>
-            <Input
-              id="fence-lat"
-              v-model.number="centerLat"
-              type="number"
-              step="0.000001"
-            />
+            <Input id="fence-lat" v-model.number="centerLat" type="number" step="0.000001" />
           </div>
-          <div class="space-y-1">
+          <div>
             <Label for="fence-lng">Center longitude</Label>
-            <Input
-              id="fence-lng"
-              v-model.number="centerLng"
-              type="number"
-              step="0.000001"
-            />
+            <Input id="fence-lng" v-model.number="centerLng" type="number" step="0.000001" />
           </div>
-          <div class="space-y-1">
+          <div>
             <Label for="fence-radius">Radius (m)</Label>
-            <Input
-              id="fence-radius"
-              v-model.number="radiusM"
-              type="number"
-              step="10"
-              min="50"
-              max="50000"
-            />
+            <Input id="fence-radius" v-model.number="radiusM" type="number" step="10" min="50" max="50000" />
           </div>
         </div>
 
-        <div class="flex flex-wrap gap-2">
-          <Button
-            type="button"
-            :disabled="saving"
-            @click="save"
-          >
+        <div class="flex gap-2">
+          <Button type="button" :disabled="saving" @click="save">
             {{ saving ? 'Saving…' : fence ? 'Update fence' : 'Set fence' }}
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            @click="useCurrentMapCenter"
-          >
+          <Button type="button" variant="outline" @click="useCurrentMapCenter">
             Use map center
           </Button>
         </div>
 
-        <p
-          v-if="error"
-          class="text-sm text-destructive"
-          role="alert"
-        >
+        <p v-if="error" class="text-sm text-destructive" role="alert">
           {{ error }}
         </p>
 
         <ClientOnly>
-          <div
-            ref="mapEl"
-            class="h-[320px] w-full rounded-md border border-border"
-          />
+          <div ref="mapEl" class="h-[320px] w-full rounded-md border border-border" />
           <template #fallback>
             <div class="h-[320px] w-full rounded-md border border-border bg-muted" />
           </template>
