@@ -35,3 +35,8 @@ coverage/
 .DS_Store
 .vscode/
 .idea/
+
+# --- Internal workflow scaffolding (private, not part of the public project) ---
+.claude/
+CLAUDE.md
+instruction/
