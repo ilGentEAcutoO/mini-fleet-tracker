@@ -12,7 +12,7 @@ GIT_COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 LDFLAGS        := -s -w -X main.gitCommit=$(GIT_COMMIT)
 
 .DEFAULT_GOAL := help
-.PHONY: help dev build test lint docker-build clean tidy
+.PHONY: help dev build test lint docker-build clean tidy sim seed
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"; printf "Available targets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  %-14s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -47,3 +47,13 @@ tidy: ## go mod tidy
 
 clean: ## Remove build artifacts
 	rm -rf $(BIN_DIR)
+
+# Driver simulator (Bonus 1) — usage:
+#   make sim ARGS="--email driver@demo.local --password ... --vehicle-id ... --interval 2s"
+sim: ## Run the driver simulator (Bonus 1)
+	$(GO) run ./cmd/sim $(ARGS)
+
+# Demo data seed — creates 1 manager, 1 driver, 3 vehicles, and
+# assigns the driver to DEMO-001. Idempotent: re-runs are a no-op.
+seed: ## Seed demo data (1 manager, 1 driver, 3 vehicles)
+	$(GO) run ./cmd/seed
