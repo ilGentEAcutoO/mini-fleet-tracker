@@ -120,7 +120,12 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	// the driver-ownership check — its Get method satisfies that contract
 	// directly, so we wire the same instance into both usecases.
 	vehicleRepo := d1repo.NewVehicleRepo(d1Client)
-	vehicleUC, err := usecase.NewVehicleUsecase(vehicleRepo, usecase.IDGeneratorFunc(uuid.NewString))
+	// PositionRepo built here (before PositionUsecase) because TASK-018
+	// also gives VehicleUsecase a PositionLister dependency for the
+	// history endpoint. The same *d1repo.PositionRepo instance satisfies
+	// both the PositionUsecase's writer and the VehicleUsecase's lister.
+	positionRepo := d1repo.NewPositionRepo(d1Client)
+	vehicleUC, err := usecase.NewVehicleUsecase(vehicleRepo, positionRepo, usecase.IDGeneratorFunc(uuid.NewString))
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("setup: vehicle usecase: %w", err)
 	}
@@ -156,7 +161,6 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 		positionEventPublisher = fleetPub
 	}
 
-	positionRepo := d1repo.NewPositionRepo(d1Client)
 	positionUC, err := usecase.NewPositionUsecase(positionRepo, vehicleRepo, positionEventPublisher)
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("setup: position usecase: %w", err)
@@ -305,6 +309,11 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	vehicles := api.Group("/vehicles", authMW)
 	vehicles.Get("/", vehicleHandler.List)
 	vehicles.Get("/:id", vehicleHandler.Get)
+	// History endpoint (TASK-018): manager-only, idempotent read so no
+	// CSRF middleware. The handler owns the role gate, range validation,
+	// and limit clamping; the usecase composes the existence check +
+	// range query.
+	vehicles.Get("/:id/positions", vehicleHandler.History)
 	vehicles.Post("/", csrfMW, vehicleHandler.Create)
 	vehicles.Patch("/:id", csrfMW, vehicleHandler.Update)
 	vehicles.Delete("/:id", csrfMW, vehicleHandler.Delete)

@@ -156,7 +156,12 @@ func main() {
 
 	// --- Vehicles ------------------------------------------------------
 	vehicleRepo := d1repo.NewVehicleRepo(d1Client)
-	vehicleUC, err := usecase.NewVehicleUsecase(vehicleRepo, usecase.IDGeneratorFunc(uuid.NewString))
+	// PositionRepo is wired here as the PositionLister dep for
+	// VehicleUsecase (TASK-018 added the history endpoint); the seed
+	// script only touches Create, so the lister is never invoked but the
+	// constructor demands it.
+	positionRepo := d1repo.NewPositionRepo(d1Client)
+	vehicleUC, err := usecase.NewVehicleUsecase(vehicleRepo, positionRepo, usecase.IDGeneratorFunc(uuid.NewString))
 	if err != nil {
 		log.Fatal().Err(err).Msg("vehicle usecase")
 	}

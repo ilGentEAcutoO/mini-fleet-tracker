@@ -111,12 +111,65 @@ func (f *fixedIDs) NewID() string {
 	return fmt.Sprintf("veh_%03d", f.n)
 }
 
-// newTestVehicleUsecase builds a usecase with an in-memory repo and a
-// fixed clock so assertions on timestamps are deterministic.
+// memPositionLister is the in-memory PositionLister used by tests that
+// exercise VehicleUsecase.ListPositions. Insertion order is preserved so
+// tests can assert deterministic DESC ordering. byVehicle maps vehicle id
+// -> chronologically-sorted positions (oldest first); ListByVehicleAndRange
+// reverses that to satisfy the DESC contract documented on the interface.
+type memPositionLister struct {
+	mu        sync.Mutex
+	byVehicle map[string][]*domain.Position
+	// errOverride lets a specific test inject an arbitrary error from
+	// the lister without restructuring the fake.
+	errOverride error
+}
+
+func newMemPositionLister() *memPositionLister {
+	return &memPositionLister{byVehicle: map[string][]*domain.Position{}}
+}
+
+// add seeds a position. Inserts at the end so the slice stays in insert
+// (chronological-ish) order; callers should use monotonic RecordedAt
+// values if they want chronological semantics.
+func (m *memPositionLister) add(p *domain.Position) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.byVehicle[p.VehicleID] = append(m.byVehicle[p.VehicleID], p)
+}
+
+func (m *memPositionLister) ListByVehicleAndRange(_ context.Context, vehicleID string, fromMs, toMs int64, limit int) ([]*domain.Position, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.errOverride != nil {
+		return nil, m.errOverride
+	}
+	rows := m.byVehicle[vehicleID]
+	// Build the windowed result (caller filters by bounds) and reverse
+	// into DESC order to match the production repo's contract.
+	out := make([]*domain.Position, 0, len(rows))
+	for i := len(rows) - 1; i >= 0; i-- {
+		p := rows[i]
+		if fromMs > 0 && p.RecordedAt < fromMs {
+			continue
+		}
+		if toMs > 0 && p.RecordedAt > toMs {
+			continue
+		}
+		cp := *p
+		out = append(out, &cp)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// newTestVehicleUsecase builds a usecase with an in-memory repo, position
+// lister, and a fixed clock so assertions on timestamps are deterministic.
 func newTestVehicleUsecase(t *testing.T) (*VehicleUsecase, *memVehicleRepo) {
 	t.Helper()
 	repo := newMemVehicleRepo()
-	uc, err := NewVehicleUsecase(repo, &fixedIDs{})
+	uc, err := NewVehicleUsecase(repo, newMemPositionLister(), &fixedIDs{})
 	if err != nil {
 		t.Fatalf("NewVehicleUsecase: %v", err)
 	}
@@ -127,25 +180,44 @@ func newTestVehicleUsecase(t *testing.T) (*VehicleUsecase, *memVehicleRepo) {
 	return uc, repo
 }
 
+// newTestVehicleUsecaseWithPositions returns the usecase plus the
+// position-lister handle so history-specific tests can seed rows or set
+// the error override. Mirrors newTestVehicleUsecase otherwise.
+func newTestVehicleUsecaseWithPositions(t *testing.T) (*VehicleUsecase, *memVehicleRepo, *memPositionLister) {
+	t.Helper()
+	repo := newMemVehicleRepo()
+	pl := newMemPositionLister()
+	uc, err := NewVehicleUsecase(repo, pl, &fixedIDs{})
+	if err != nil {
+		t.Fatalf("NewVehicleUsecase: %v", err)
+	}
+	fixed := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	uc.now = func() time.Time { return fixed }
+	return uc, repo, pl
+}
+
 // ---------------------------------------------------------------------------
 // Construction.
 // ---------------------------------------------------------------------------
 
 func TestNewVehicleUsecase_RejectsNilDependencies(t *testing.T) {
 	repo := newMemVehicleRepo()
+	pl := newMemPositionLister()
 	ids := &fixedIDs{}
 
 	cases := []struct {
 		name string
 		r    VehicleRepo
+		p    PositionLister
 		id   IDGenerator
 	}{
-		{"nil repo", nil, ids},
-		{"nil ids", repo, nil},
+		{"nil repo", nil, pl, ids},
+		{"nil positions", repo, nil, ids},
+		{"nil ids", repo, pl, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := NewVehicleUsecase(tc.r, tc.id); err == nil {
+			if _, err := NewVehicleUsecase(tc.r, tc.p, tc.id); err == nil {
 				t.Fatalf("NewVehicleUsecase should reject %s", tc.name)
 			}
 		})
@@ -556,5 +628,191 @@ func TestVehicleUsecase_Delete_EmptyID(t *testing.T) {
 		t.Fatal("Delete with empty id must fail")
 	} else if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("expected ErrValidation, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ListPositions — TASK-018 history endpoint.
+// ---------------------------------------------------------------------------
+
+func TestVehicleUsecase_ListPositions_Success(t *testing.T) {
+	uc, _, pl := newTestVehicleUsecaseWithPositions(t)
+	v, err := uc.Create(context.Background(), CreateVehicleInput{PlateNumber: "OK-1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Three positions, oldest-first; the fake reverses to satisfy the
+	// repo's DESC contract.
+	for i, ts := range []int64{1000, 2000, 3000} {
+		pl.add(&domain.Position{
+			ID:         int64(i + 1),
+			VehicleID:  v.ID,
+			Lat:        13.0 + float64(i)*0.1,
+			Lng:        100.0 + float64(i)*0.1,
+			RecordedAt: ts,
+		})
+	}
+	got, err := uc.ListPositions(context.Background(), v.ID, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("ListPositions: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 positions, got %d", len(got))
+	}
+	// DESC order — newest first.
+	if got[0].RecordedAt != 3000 || got[2].RecordedAt != 1000 {
+		t.Errorf("DESC order broken: %d, %d, %d", got[0].RecordedAt, got[1].RecordedAt, got[2].RecordedAt)
+	}
+}
+
+func TestVehicleUsecase_ListPositions_EmptyResult(t *testing.T) {
+	// Vehicle exists, no positions. Must return non-nil empty slice + nil
+	// error so the handler can JSON-encode `[]` without a nil guard.
+	uc, _, _ := newTestVehicleUsecaseWithPositions(t)
+	v, err := uc.Create(context.Background(), CreateVehicleInput{PlateNumber: "EMPTY-1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	got, err := uc.ListPositions(context.Background(), v.ID, 0, 0, 100)
+	if err != nil {
+		t.Fatalf("ListPositions: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil empty slice")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected 0 positions, got %d", len(got))
+	}
+}
+
+func TestVehicleUsecase_ListPositions_VehicleNotFound(t *testing.T) {
+	uc, _, _ := newTestVehicleUsecaseWithPositions(t)
+	_, err := uc.ListPositions(context.Background(), "veh_does_not_exist", 0, 0, 0)
+	if err == nil {
+		t.Fatal("expected error for missing vehicle")
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got: %v", err)
+	}
+}
+
+func TestVehicleUsecase_ListPositions_EmptyID(t *testing.T) {
+	uc, _, _ := newTestVehicleUsecaseWithPositions(t)
+	_, err := uc.ListPositions(context.Background(), "   ", 0, 0, 0)
+	if err == nil {
+		t.Fatal("expected validation error for empty id")
+	}
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("expected ErrValidation, got: %v", err)
+	}
+}
+
+func TestVehicleUsecase_ListPositions_FromGreaterThanTo(t *testing.T) {
+	uc, _, _ := newTestVehicleUsecaseWithPositions(t)
+	v, err := uc.Create(context.Background(), CreateVehicleInput{PlateNumber: "OK-2"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, err = uc.ListPositions(context.Background(), v.ID, 5000, 1000, 0)
+	if err == nil {
+		t.Fatal("expected validation error when from > to")
+	}
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("expected ErrValidation, got: %v", err)
+	}
+}
+
+func TestVehicleUsecase_ListPositions_NegativeLimit(t *testing.T) {
+	uc, _, _ := newTestVehicleUsecaseWithPositions(t)
+	v, err := uc.Create(context.Background(), CreateVehicleInput{PlateNumber: "OK-3"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, err = uc.ListPositions(context.Background(), v.ID, 0, 0, -1)
+	if err == nil {
+		t.Fatal("expected validation error for negative limit")
+	}
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("expected ErrValidation, got: %v", err)
+	}
+}
+
+func TestVehicleUsecase_ListPositions_NegativeBounds(t *testing.T) {
+	uc, _, _ := newTestVehicleUsecaseWithPositions(t)
+	v, err := uc.Create(context.Background(), CreateVehicleInput{PlateNumber: "OK-4"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = uc.ListPositions(context.Background(), v.ID, -1, 0, 0); err == nil || !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("from < 0 should be ErrValidation, got %v", err)
+	}
+	if _, err = uc.ListPositions(context.Background(), v.ID, 0, -1, 0); err == nil || !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("to < 0 should be ErrValidation, got %v", err)
+	}
+}
+
+func TestVehicleUsecase_ListPositions_LimitClampedSilently(t *testing.T) {
+	// limit > maxHistoryLimit must NOT error; it must clamp to
+	// maxHistoryLimit and forward that ceiling to the repo. We assert via
+	// the fake's behaviour by seeding (maxHistoryLimit+10) rows and
+	// checking the call returns exactly maxHistoryLimit.
+	uc, _, pl := newTestVehicleUsecaseWithPositions(t)
+	v, err := uc.Create(context.Background(), CreateVehicleInput{PlateNumber: "BIG-1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for i := 0; i < maxHistoryLimit+10; i++ {
+		pl.add(&domain.Position{
+			ID:         int64(i + 1),
+			VehicleID:  v.ID,
+			RecordedAt: int64(i + 1),
+		})
+	}
+	got, err := uc.ListPositions(context.Background(), v.ID, 0, 0, maxHistoryLimit+100)
+	if err != nil {
+		t.Fatalf("ListPositions: %v", err)
+	}
+	if len(got) != maxHistoryLimit {
+		t.Fatalf("expected clamped result of %d rows, got %d", maxHistoryLimit, len(got))
+	}
+}
+
+func TestVehicleUsecase_ListPositions_DefaultLimit(t *testing.T) {
+	// limit == 0 means "apply defaultHistoryLimit" — verify the cap
+	// applies even when the fake holds many more rows.
+	uc, _, pl := newTestVehicleUsecaseWithPositions(t)
+	v, err := uc.Create(context.Background(), CreateVehicleInput{PlateNumber: "DFL-1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for i := 0; i < defaultHistoryLimit+50; i++ {
+		pl.add(&domain.Position{
+			ID:         int64(i + 1),
+			VehicleID:  v.ID,
+			RecordedAt: int64(i + 1),
+		})
+	}
+	got, err := uc.ListPositions(context.Background(), v.ID, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("ListPositions: %v", err)
+	}
+	if len(got) != defaultHistoryLimit {
+		t.Fatalf("expected default limit of %d, got %d", defaultHistoryLimit, len(got))
+	}
+}
+
+func TestVehicleUsecase_ListPositions_ListerErrorPropagates(t *testing.T) {
+	uc, _, pl := newTestVehicleUsecaseWithPositions(t)
+	v, err := uc.Create(context.Background(), CreateVehicleInput{PlateNumber: "FAIL-1"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	pl.errOverride = errors.New("d1 outage")
+	_, err = uc.ListPositions(context.Background(), v.ID, 0, 0, 0)
+	if err == nil {
+		t.Fatal("expected lister error to propagate")
+	}
+	if err.Error() != "d1 outage" {
+		t.Errorf("error: got %q, want %q", err.Error(), "d1 outage")
 	}
 }

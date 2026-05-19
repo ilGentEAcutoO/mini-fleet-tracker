@@ -233,7 +233,7 @@ async function onDelete(v: Vehicle): Promise<void> {
               <TableHead>Plate</TableHead>
               <TableHead>Model</TableHead>
               <TableHead>Driver ID</TableHead>
-              <TableHead class="w-[160px] text-right">
+              <TableHead class="w-[240px] text-right">
                 Actions
               </TableHead>
             </TableRow>
@@ -260,6 +260,15 @@ async function onDelete(v: Vehicle): Promise<void> {
                 <span v-else class="text-muted-foreground">unassigned</span>
               </TableCell>
               <TableCell class="text-right space-x-1">
+                <Button
+                  as-child
+                  variant="ghost"
+                  size="sm"
+                >
+                  <NuxtLink :to="`/dashboard/vehicles/${v.id}`">
+                    History
+                  </NuxtLink>
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"

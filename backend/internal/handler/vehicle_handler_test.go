@@ -28,7 +28,11 @@ type memVehicleUsecase struct {
 	mu       sync.Mutex
 	byID     map[string]*domain.Vehicle
 	plateIdx map[string]string
-	idSeq    int
+	// positions stores per-vehicle history in insertion order. The
+	// ListPositions fake reverses to satisfy the DESC contract and applies
+	// the [from, to] window + limit just like the real repo.
+	positions map[string][]*domain.Position
+	idSeq     int
 	// errOverride lets a specific test inject a custom error from any method
 	// without rewriting the entire fake. nil means "default behaviour".
 	errOverride map[string]error
@@ -38,8 +42,19 @@ func newMemVehicleUsecase() *memVehicleUsecase {
 	return &memVehicleUsecase{
 		byID:        map[string]*domain.Vehicle{},
 		plateIdx:    map[string]string{},
+		positions:   map[string][]*domain.Position{},
 		errOverride: map[string]error{},
 	}
+}
+
+// seedPosition appends a position to the fake's per-vehicle list. Tests
+// call this directly because pushing through the position usecase would
+// require wiring the full publisher/freshness stack — overkill when the
+// goal is just "make List return rows".
+func (m *memVehicleUsecase) seedPosition(p *domain.Position) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.positions[p.VehicleID] = append(m.positions[p.VehicleID], p)
 }
 
 func (m *memVehicleUsecase) nextID() string {
@@ -146,6 +161,64 @@ func (m *memVehicleUsecase) Delete(_ context.Context, id string) error {
 	return nil
 }
 
+// ListPositions mirrors the real usecase: validates params, checks vehicle
+// existence, then returns the windowed slice in DESC order. Tests can
+// drive the fake by seeding via seedPosition and asserting on the
+// returned ordering.
+//
+// The clamp logic uses literal constants matching the production
+// constants in vehicle_usecase.go (defaultHistoryLimit=1000,
+// maxHistoryLimit=5000). Keeping the two in sync is a deliberate cost —
+// importing the usecase package's unexported consts is not possible, and
+// promoting them to exported names just for tests would leak an
+// implementation detail. Drift here would break tests immediately, which
+// is the right failure mode.
+func (m *memVehicleUsecase) ListPositions(_ context.Context, id string, fromMs, toMs int64, limit int) ([]*domain.Position, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.errOverride["ListPositions"]; err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("id required: %w", domain.ErrValidation)
+	}
+	if fromMs < 0 || toMs < 0 {
+		return nil, fmt.Errorf("bounds must be non-negative: %w", domain.ErrValidation)
+	}
+	if fromMs > 0 && toMs > 0 && fromMs > toMs {
+		return nil, fmt.Errorf("from > to: %w", domain.ErrValidation)
+	}
+	if limit < 0 {
+		return nil, fmt.Errorf("limit must be non-negative: %w", domain.ErrValidation)
+	}
+	if limit == 0 {
+		limit = 1000
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	if _, ok := m.byID[id]; !ok {
+		return nil, fmt.Errorf("id %s: %w", id, domain.ErrNotFound)
+	}
+	rows := m.positions[id]
+	out := make([]*domain.Position, 0, len(rows))
+	for i := len(rows) - 1; i >= 0; i-- {
+		p := rows[i]
+		if fromMs > 0 && p.RecordedAt < fromMs {
+			continue
+		}
+		if toMs > 0 && p.RecordedAt > toMs {
+			continue
+		}
+		cp := *p
+		out = append(out, &cp)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // Harness — mirrors the pattern in position_handler_test.go: real auth
 // middleware, real CSRF, JWT signer, only the usecase is faked.
@@ -179,7 +252,13 @@ func newVehicleHarness(t *testing.T) *vehicleHarness {
 	app.Use(middleware.NewCSRF())
 
 	app.Get("/api/vehicles", h.List)
+	// Order matters: /:id/positions must register before /:id so Fiber's
+	// trie matches the more specific path first. Production wiring in
+	// bootstrap.go uses the inverse order (List, Get, History, ...) but
+	// the bare /:id route uses different segment counts, so collision is
+	// avoided either way; here we mirror production order for parity.
 	app.Get("/api/vehicles/:id", h.Get)
+	app.Get("/api/vehicles/:id/positions", h.History)
 	app.Post("/api/vehicles", h.Create)
 	app.Patch("/api/vehicles/:id", h.Update)
 	app.Delete("/api/vehicles/:id", h.Delete)
@@ -641,5 +720,216 @@ func TestVehicleDTO_OmitsEmptyOptionalFields(t *testing.T) {
 	}
 	if dto.DriverID != "" {
 		t.Errorf("DriverID: got %q, want empty", dto.DriverID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// History (GET /api/vehicles/:id/positions) — TASK-018.
+// ---------------------------------------------------------------------------
+
+// seedVehicleAndHistory creates a vehicle on the fake and returns its ID
+// plus a helper to push N positions with monotonically-increasing
+// recorded_at timestamps. Keeps the per-test boilerplate small.
+func seedVehicleAndHistory(t *testing.T, h *vehicleHarness, plate string, n int, baseMs int64) string {
+	t.Helper()
+	v, err := h.mock.Create(context.Background(), usecase.CreateVehicleInput{PlateNumber: plate})
+	if err != nil {
+		t.Fatalf("seed vehicle: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		h.mock.seedPosition(&domain.Position{
+			ID:         int64(i + 1),
+			VehicleID:  v.ID,
+			Lat:        13.0 + float64(i)*0.001,
+			Lng:        100.0 + float64(i)*0.001,
+			RecordedAt: baseMs + int64(i)*1000,
+		})
+	}
+	return v.ID
+}
+
+func TestVehicleHistory_NoAuth_401(t *testing.T) {
+	h := newVehicleHarness(t)
+	id := seedVehicleAndHistory(t, h, "HIST-1", 3, 1_700_000_000_000)
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, "/api/vehicles/"+id+"/positions", nil, ""))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+func TestVehicleHistory_AsDriver_403(t *testing.T) {
+	h := newVehicleHarness(t)
+	id := seedVehicleAndHistory(t, h, "HIST-2", 3, 1_700_000_000_000)
+	cookie := h.issueCookie(t, "drv_001", "driver")
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, "/api/vehicles/"+id+"/positions", nil, cookie))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+func TestVehicleHistory_AsManager_200(t *testing.T) {
+	h := newVehicleHarness(t)
+	id := seedVehicleAndHistory(t, h, "HIST-3", 3, 1_700_000_000_000)
+	cookie := h.issueCookie(t, "mgr_001", "manager")
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, "/api/vehicles/"+id+"/positions", nil, cookie))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, readBody(t, resp))
+	}
+	body := readBody(t, resp)
+	if !strings.Contains(body, `"vehicle_id":"`+id+`"`) {
+		t.Errorf("body missing vehicle_id: %s", body)
+	}
+	if !strings.Contains(body, `"count":3`) {
+		t.Errorf("body missing count=3: %s", body)
+	}
+	if !strings.Contains(body, `"positions"`) {
+		t.Errorf("body missing positions key: %s", body)
+	}
+}
+
+func TestVehicleHistory_OrderDescByRecordedAt(t *testing.T) {
+	h := newVehicleHarness(t)
+	id := seedVehicleAndHistory(t, h, "HIST-4", 3, 1_700_000_000_000)
+	cookie := h.issueCookie(t, "mgr_001", "manager")
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, "/api/vehicles/"+id+"/positions", nil, cookie))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	body := readBody(t, resp)
+	// Newest first — third (recorded_at 1_700_000_002_000) should appear
+	// before the oldest (recorded_at 1_700_000_000_000) in the JSON.
+	idxNewest := strings.Index(body, `"recorded_at":1700000002000`)
+	idxOldest := strings.Index(body, `"recorded_at":1700000000000`)
+	if idxNewest < 0 || idxOldest < 0 {
+		t.Fatalf("recorded_at markers missing in body: %s", body)
+	}
+	if idxNewest > idxOldest {
+		t.Errorf("DESC order broken: newest appears after oldest in body: %s", body)
+	}
+}
+
+func TestVehicleHistory_NotFound_404(t *testing.T) {
+	h := newVehicleHarness(t)
+	cookie := h.issueCookie(t, "mgr_001", "manager")
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, "/api/vehicles/veh_missing/positions", nil, cookie))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+func TestVehicleHistory_FromGreaterThanTo_400(t *testing.T) {
+	h := newVehicleHarness(t)
+	id := seedVehicleAndHistory(t, h, "HIST-5", 3, 1_700_000_000_000)
+	cookie := h.issueCookie(t, "mgr_001", "manager")
+	url := "/api/vehicles/" + id + "/positions?from=2000&to=1000"
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, url, nil, cookie))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, readBody(t, resp))
+	}
+}
+
+func TestVehicleHistory_LimitClampedAt5000(t *testing.T) {
+	// Seed > 5000 rows; request limit=99999. Expect the response to
+	// contain exactly 5000 positions (silent clamp).
+	h := newVehicleHarness(t)
+	v, err := h.mock.Create(context.Background(), usecase.CreateVehicleInput{PlateNumber: "BIG-1"})
+	if err != nil {
+		t.Fatalf("seed vehicle: %v", err)
+	}
+	// 5100 rows is more than enough to hit the cap.
+	for i := 0; i < 5100; i++ {
+		h.mock.seedPosition(&domain.Position{
+			ID:         int64(i + 1),
+			VehicleID:  v.ID,
+			RecordedAt: int64(i + 1),
+		})
+	}
+	cookie := h.issueCookie(t, "mgr_001", "manager")
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, "/api/vehicles/"+v.ID+"/positions?limit=99999", nil, cookie))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, readBody(t, resp))
+	}
+	// Substring match for "count":5000 — the assert avoids unmarshalling
+	// the whole 5000-row body, which would be wasteful here.
+	if got := readBody(t, resp); !strings.Contains(got, `"count":5000`) {
+		t.Errorf(`expected "count":5000 in body, got prefix: %s`, got[:min(120, len(got))])
+	}
+}
+
+func TestVehicleHistory_NoParamsUsesDefaults(t *testing.T) {
+	// No query params; expect default limit (1000) to apply. Seed 1500
+	// rows so the cap is observable; expect 1000 in the response.
+	h := newVehicleHarness(t)
+	v, err := h.mock.Create(context.Background(), usecase.CreateVehicleInput{PlateNumber: "DFL-1"})
+	if err != nil {
+		t.Fatalf("seed vehicle: %v", err)
+	}
+	for i := 0; i < 1500; i++ {
+		h.mock.seedPosition(&domain.Position{
+			ID:         int64(i + 1),
+			VehicleID:  v.ID,
+			RecordedAt: int64(i + 1),
+		})
+	}
+	cookie := h.issueCookie(t, "mgr_001", "manager")
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, "/api/vehicles/"+v.ID+"/positions", nil, cookie))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if got := readBody(t, resp); !strings.Contains(got, `"count":1000`) {
+		t.Errorf(`expected "count":1000, got prefix: %s`, got[:min(120, len(got))])
+	}
+}
+
+func TestVehicleHistory_RangeBracketingFilters(t *testing.T) {
+	// Seed positions at recorded_at = 1000, 2000, 3000, 4000, 5000.
+	// Request from=2000&to=4000 — expect 3 rows.
+	h := newVehicleHarness(t)
+	v, err := h.mock.Create(context.Background(), usecase.CreateVehicleInput{PlateNumber: "RANGE-1"})
+	if err != nil {
+		t.Fatalf("seed vehicle: %v", err)
+	}
+	for _, ts := range []int64{1000, 2000, 3000, 4000, 5000} {
+		h.mock.seedPosition(&domain.Position{VehicleID: v.ID, RecordedAt: ts})
+	}
+	cookie := h.issueCookie(t, "mgr_001", "manager")
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, "/api/vehicles/"+v.ID+"/positions?from=2000&to=4000", nil, cookie))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if got := readBody(t, resp); !strings.Contains(got, `"count":3`) {
+		t.Errorf(`expected "count":3, got: %s`, got)
+	}
+}
+
+func TestVehicleHistory_InternalError_500(t *testing.T) {
+	h := newVehicleHarness(t)
+	id := seedVehicleAndHistory(t, h, "HIST-ERR", 1, 1_700_000_000_000)
+	h.mock.errOverride["ListPositions"] = errors.New("d1 outage")
+	cookie := h.issueCookie(t, "mgr_001", "manager")
+	resp, err := h.app.Test(vehReq(t, http.MethodGet, "/api/vehicles/"+id+"/positions", nil, cookie))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", resp.StatusCode, readBody(t, resp))
 	}
 }

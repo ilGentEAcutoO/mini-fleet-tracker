@@ -24,6 +24,10 @@ type VehicleUsecase interface {
 	Create(ctx context.Context, in usecase.CreateVehicleInput) (*domain.Vehicle, error)
 	Update(ctx context.Context, id string, in usecase.UpdateVehicleInput) (*domain.Vehicle, error)
 	Delete(ctx context.Context, id string) error
+	// ListPositions powers the TASK-018 history endpoint. The handler
+	// converts query params into the unix-ms / limit triple; the usecase
+	// owns validation and the existence check.
+	ListPositions(ctx context.Context, id string, fromMs, toMs int64, limit int) ([]*domain.Position, error)
 }
 
 // VehicleHandler is the HTTP-facing facade for the vehicle CRUD workflows.
@@ -113,6 +117,22 @@ type vehicleBody struct {
 // pagination metadata without breaking the existing contract.
 type vehicleListBody struct {
 	Vehicles []vehicleDTO `json:"vehicles"`
+}
+
+// historyBody is the response envelope for the GET /api/vehicles/:id/positions
+// endpoint. VehicleID is repeated outside the slice so the client can
+// double-check it matches the route param without parsing the first
+// position; Count is supplied so the frontend can render
+// "N points" without iterating the array twice.
+//
+// Positions reuses the same positionDTO defined in position_handler.go to
+// keep one wire-shape per entity — adding a parallel "historyDTO" with
+// trivially-different field names would create exactly the kind of
+// drift the SPA's `Position` TypeScript interface is supposed to prevent.
+type historyBody struct {
+	VehicleID string        `json:"vehicle_id"`
+	Positions []positionDTO `json:"positions"`
+	Count     int           `json:"count"`
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +241,62 @@ func (h *VehicleHandler) Delete(c *fiber.Ctx) error {
 		return h.mapDomainError(c, err, "could not delete vehicle")
 	}
 	return c.SendStatus(http.StatusNoContent)
+}
+
+// History returns up to `limit` positions for the :id vehicle in the
+// optional range [from, to] (both unix-ms; either or both may be omitted
+// or zero to mean "no bound"). GET /api/vehicles/:id/positions, manager-only.
+//
+// Query parameters:
+//
+//	from   optional unix-ms, default 0 = "no lower bound"
+//	to     optional unix-ms, default 0 = "no upper bound"
+//	limit  optional int, default 1000, hard-capped at 5000
+//
+// The handler parses & forwards; the usecase owns validation (range
+// ordering, non-negativity, limit clamping) and the existence check.
+//
+// Status codes:
+//
+//	200 on success (with historyBody)
+//	400 on validation (from > to, negative bounds, etc.)
+//	401 missing auth context
+//	403 not a manager
+//	404 vehicle id does not exist
+//	500 on infra failure
+//
+// The DESC ordering by recorded_at comes from the repository contract.
+// Clients that need chronological order for polyline rendering should
+// reverse the slice on receive — see the frontend history page.
+func (h *VehicleHandler) History(c *fiber.Ctx) error {
+	if denied, err := h.denyIfNotManager(c); denied {
+		return err
+	}
+
+	id := c.Params("id")
+
+	// QueryInt returns 0 when the key is absent or unparseable, which is
+	// exactly the "no bound" sentinel the usecase expects. The handler
+	// does not need its own zero-check — the usecase's validation rejects
+	// the only ambiguous case (a literally-negative integer).
+	fromMs := int64(c.QueryInt("from", 0))
+	toMs := int64(c.QueryInt("to", 0))
+	limit := c.QueryInt("limit", 0)
+
+	positions, err := h.usecase.ListPositions(c.UserContext(), id, fromMs, toMs, limit)
+	if err != nil {
+		return h.mapDomainError(c, err, "could not list positions")
+	}
+
+	dtos := make([]positionDTO, 0, len(positions))
+	for _, p := range positions {
+		dtos = append(dtos, toPositionDTO(p))
+	}
+	return c.JSON(historyBody{
+		VehicleID: id,
+		Positions: dtos,
+		Count:     len(dtos),
+	})
 }
 
 // ---------------------------------------------------------------------------

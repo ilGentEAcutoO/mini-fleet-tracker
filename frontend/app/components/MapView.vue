@@ -15,6 +15,13 @@
 // read it from runtime config; if it's missing we still render the map (the
 // AdvancedMarker class falls back to a console warning, not a crash, but
 // pins render with the legacy style).
+//
+// TASK-018 added an optional `path` prop for the history view. When
+// supplied, the component renders a single Polyline through the points in
+// order (the parent is responsible for chronological sorting — the
+// backend returns DESC by recorded_at). The Polyline instance is reused
+// across prop changes (setPath, not recreate) for the same flicker-free
+// reason the markers do.
 
 import type { Position } from '~~/shared/types/domain'
 
@@ -23,12 +30,17 @@ interface Props {
   // call `.set(id, pos)` to upsert without a deep clone, and so we can iterate
   // entries in insertion order to keep z-order stable across renders.
   positions: Map<string, Position>
+  // Optional ordered path. When non-empty, MapView draws a Polyline through
+  // these points (in order). Pass `undefined` (or omit) to skip the
+  // polyline entirely — the live dashboard does not use this.
+  path?: Position[]
   center?: { lat: number; lng: number }
   zoom?: number
   className?: string
 }
 
 const props = withDefaults(defineProps<Props>(), {
+  path: () => [],
   // Bangkok — chosen because the demo dataset is Bangkok-flavoured and the
   // dashboard's initial empty state should look intentional, not "lost at
   // coordinate 0,0 in the Atlantic".
@@ -46,6 +58,9 @@ const mapEl = ref<HTMLElement | null>(null)
 // and triggers SDK warnings about frozen prototypes.
 const map = shallowRef<google.maps.Map | null>(null)
 const markers = new Map<string, google.maps.marker.AdvancedMarkerElement>()
+// Single reusable Polyline instance for the history-view path. shallowRef
+// for the same reason as `map` — the SDK object is intentionally opaque.
+const polyline = shallowRef<google.maps.Polyline | null>(null)
 const error = ref<string | null>(null)
 
 onMounted(async () => {
@@ -70,6 +85,9 @@ onMounted(async () => {
 
     // Initial render with whatever positions the parent already has.
     await syncMarkers()
+    // Initial path render. Cheap when path is empty — the function
+    // short-circuits before reaching for the SDK library.
+    await syncPath()
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : 'Failed to load map'
   }
@@ -83,6 +101,20 @@ watch(
   () => Array.from(props.positions.values()),
   () => {
     if (map.value) void syncMarkers()
+  },
+  { deep: false },
+)
+
+// Watch the path. We trigger on length + first/last identity so swapping
+// out the array reference always fires, but a parent that pushes the same
+// reference unchanged doesn't pay for a redundant SDK round-trip. Path
+// equality of arrays in Vue would require a deep watcher, which is more
+// expensive than needed here — we already get fresh prop updates whenever
+// the parent reassigns the prop.
+watch(
+  () => props.path,
+  () => {
+    if (map.value) void syncPath()
   },
   { deep: false },
 )
@@ -122,11 +154,56 @@ async function syncMarkers() {
   }
 }
 
+// syncPath reconciles the Polyline instance with `props.path`. When the
+// path is empty we tear down any existing polyline so the map view goes
+// clean. When the path is non-empty we reuse the existing polyline (just
+// call setPath) to avoid the SDK's create/destroy cost — a 1000-vertex
+// polyline takes a noticeable beat to instantiate on a cold map.
+async function syncPath() {
+  if (!map.value) return
+  const path = props.path
+  if (!path || path.length === 0) {
+    if (polyline.value) {
+      polyline.value.setMap(null)
+      polyline.value = null
+    }
+    return
+  }
+  // Polyline lives in the `maps` library (same as the Map constructor), so
+  // this importLibrary call is a hot-cache hit after onMounted — no extra
+  // network round trip.
+  const { Polyline } = (await google.maps.importLibrary(
+    'maps',
+  )) as google.maps.MapsLibrary
+  const coords = path.map(p => ({ lat: p.lat, lng: p.lng }))
+  if (!polyline.value) {
+    polyline.value = new Polyline({
+      map: map.value,
+      path: coords,
+      // A clear, fleet-blue line — visible against the default roadmap
+      // tiles without competing with the live marker dots. strokeWeight 3
+      // is the sweet spot: thin enough not to obscure the route detail,
+      // thick enough to read on a phone at zoom 12.
+      strokeColor: '#2563eb',
+      strokeOpacity: 0.85,
+      strokeWeight: 3,
+      geodesic: true,
+    })
+  }
+  else {
+    polyline.value.setPath(coords)
+  }
+}
+
 onBeforeUnmount(() => {
   for (const marker of markers.values()) {
     marker.map = null
   }
   markers.clear()
+  if (polyline.value) {
+    polyline.value.setMap(null)
+    polyline.value = null
+  }
   map.value = null
 })
 </script>
