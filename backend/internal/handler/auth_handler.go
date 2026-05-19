@@ -52,7 +52,7 @@ type TokenIntrospector interface {
 
 // CookieAttrs captures the per-environment cookie attributes. Production
 // sets Secure=true and Domain to the public host so the browser scopes
-// the cookie to fleet-tracker.jairuchan.com; development leaves Secure=
+// the cookie to fleet-tracker.jairukchan.com; development leaves Secure=
 // false and Domain empty so plain HTTP localhost works without TLS.
 //
 // SameSite is fixed to Lax in both environments — Strict would break the
@@ -82,8 +82,8 @@ func DefaultCookieAttrs(isDevelopment bool) CookieAttrs {
 	return CookieAttrs{
 		Secure: true,
 		// Empty Domain is deliberate: it scopes the cookie to the host
-		// that issued it (fleet-tracker.jairuchan.com), not the apex
-		// (.jairuchan.com). That matches the demo's intent — only the
+		// that issued it (fleet-tracker.jairukchan.com), not the apex
+		// (.jairukchan.com). That matches the demo's intent — only the
 		// fleet tracker SPA should receive these cookies, not any other
 		// app on the parent domain.
 		Domain:   "",

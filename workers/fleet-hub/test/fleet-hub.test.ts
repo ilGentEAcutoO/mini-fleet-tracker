@@ -103,8 +103,8 @@ describe('isOriginAllowed', () => {
     expect(isOriginAllowed('http://localhost:3000', 'http://localhost:3000')).toBe(true)
   })
   it('handles a comma-separated list', () => {
-    const list = 'http://localhost:3000,https://fleet-tracker.jairuchan.com'
-    expect(isOriginAllowed('https://fleet-tracker.jairuchan.com', list)).toBe(true)
+    const list = 'http://localhost:3000,https://fleet-tracker.jairukchan.com'
+    expect(isOriginAllowed('https://fleet-tracker.jairukchan.com', list)).toBe(true)
   })
   it('rejects an unknown origin', () => {
     expect(isOriginAllowed('https://attacker.example', 'http://localhost:3000')).toBe(false)

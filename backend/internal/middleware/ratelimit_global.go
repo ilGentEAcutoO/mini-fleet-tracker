@@ -13,7 +13,7 @@ import (
 // Global cost-protection rate limits. These are the project-wide umbrella
 // that applies to every request on the API, regardless of route. They
 // exist to bound runaway cost on Cloudflare D1, KV, and Container CPU
-// when the public demo is exposed at fleet-tracker.jairuchan.com — a
+// when the public demo is exposed at fleet-tracker.jairukchan.com — a
 // single rogue IP cannot drain the free-tier ceilings in an afternoon.
 //
 // Two layered windows per IP:

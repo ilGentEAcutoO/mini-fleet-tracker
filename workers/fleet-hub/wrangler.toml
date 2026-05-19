@@ -33,7 +33,7 @@ new_sqlite_classes = ["FleetHub"]
 [vars]
 # Comma-separated list of allowed Origin values for the WS upgrade.
 # TASK-024 will trim this to just the prod origin.
-ALLOWED_ORIGINS = "http://localhost:3000,https://fleet-tracker.jairuchan.com"
+ALLOWED_ORIGINS = "http://localhost:3000,https://fleet-tracker.jairukchan.com"
 
 # Observability hooks deferred to TASK-024; left commented for clarity:
 # [observability]

@@ -31,7 +31,7 @@ graph TB
     subgraph Browser
         B[Browser]
     end
-    subgraph CF["Cloudflare — single origin fleet-tracker.jairuchan.com"]
+    subgraph CF["Cloudflare — single origin fleet-tracker.jairukchan.com"]
         FW["Frontend Worker<br/>Nuxt 4 SSR (Nitro cloudflare_module)"]
         GW["Gateway Worker<br/>routing, CSP, expiry short-circuit"]
         DO["FleetHub Durable Object<br/>WS hibernation + HMAC publish"]
@@ -65,10 +65,10 @@ The single-origin path-based dispatch is the cornerstone of the security model.
 
 | Pattern | Worker | Destination | Notes |
 |---------|--------|-------------|-------|
-| `fleet-tracker.jairuchan.com/api/*` | Gateway | Container (Go Fiber) | HTTP/1.1 + HTTP/2 |
-| `fleet-tracker.jairuchan.com/ws/*` | Gateway | FleetHub Durable Object | WebSocket upgrade |
-| `fleet-tracker.jairuchan.com/internal/publish` | Gateway | FleetHub Durable Object | HMAC-signed, never exposed to browsers (CSP `connect-src` excludes it; gateway rejects requests without the shared secret) |
-| `fleet-tracker.jairuchan.com/*` | Frontend Worker | Nuxt SSR | Catch-all, lowest specificity |
+| `fleet-tracker.jairukchan.com/api/*` | Gateway | Container (Go Fiber) | HTTP/1.1 + HTTP/2 |
+| `fleet-tracker.jairukchan.com/ws/*` | Gateway | FleetHub Durable Object | WebSocket upgrade |
+| `fleet-tracker.jairukchan.com/internal/publish` | Gateway | FleetHub Durable Object | HMAC-signed, never exposed to browsers (CSP `connect-src` excludes it; gateway rejects requests without the shared secret) |
+| `fleet-tracker.jairukchan.com/*` | Frontend Worker | Nuxt SSR | Catch-all, lowest specificity |
 
 Cloudflare resolves Worker routes by specificity, so the same hostname can dispatch to two Workers cleanly. Dev mode uses `wrangler dev` to emulate the same dispatch at `http://localhost:8787`, which keeps the same-origin assumptions truthful in development.
 
@@ -76,8 +76,8 @@ Cloudflare resolves Worker routes by specificity, so the same hostname can dispa
 
 - **`SameSite=Lax` cookies, not `SameSite=None`.** The browser refuses to send a `SameSite=Lax` cookie on a cross-site `POST` initiated from a third-party page, so CSRF is blocked at the browser layer for top-level navigations. We keep double-submit CSRF as defence-in-depth and as a deliberate JD-aligned signal.
 - **No CORS preflight on same-origin fetches.** That means the browser sends the auth cookie immediately on first request; no extra round-trip; no `Access-Control-Allow-Credentials` permission slip to mis-configure.
-- **The WebSocket handshake sends cookies automatically.** Authenticating `wss://fleet-tracker.jairuchan.com/ws/fleet` is a normal HTTP upgrade with the JWT cookie present in headers — no `?token=` query string, no client-side token wrangling.
-- **CSP can be tight.** The deployed policy is `default-src 'self'; script-src 'self' https://maps.googleapis.com; connect-src 'self' wss://fleet-tracker.jairuchan.com https://maps.googleapis.com; img-src 'self' data: https://maps.gstatic.com https://*.googleapis.com; frame-ancestors 'none'`. The gateway Worker injects this header on every HTML response from the frontend Worker so the policy lives next to routing, not buried in a Nuxt plugin.
+- **The WebSocket handshake sends cookies automatically.** Authenticating `wss://fleet-tracker.jairukchan.com/ws/fleet` is a normal HTTP upgrade with the JWT cookie present in headers — no `?token=` query string, no client-side token wrangling.
+- **CSP can be tight.** The deployed policy is `default-src 'self'; script-src 'self' https://maps.googleapis.com; connect-src 'self' wss://fleet-tracker.jairukchan.com https://maps.googleapis.com; img-src 'self' data: https://maps.gstatic.com https://*.googleapis.com; frame-ancestors 'none'`. The gateway Worker injects this header on every HTML response from the frontend Worker so the policy lives next to routing, not buried in a Nuxt plugin.
 
 ---
 

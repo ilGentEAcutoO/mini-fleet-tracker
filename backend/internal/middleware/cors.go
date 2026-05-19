@@ -29,7 +29,7 @@ var ErrEmptyAllowOrigin = errors.New(
 // in (typically config.Config.CORSOrigin), e.g.:
 //
 //	http://localhost:3000          // dev
-//	https://fleet-tracker.jairuchan.com   // prod
+//	https://fleet-tracker.jairukchan.com   // prod
 //
 // Wildcards are rejected because the browser CORS spec forbids them when
 // credentials are sent. The configured ExposeHeaders includes

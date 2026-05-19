@@ -12,14 +12,14 @@
 //
 // Cookies (SameSite=Lax) work without cross-origin CORS in prod because
 // the gateway, the Container, and the SPA all share the
-// fleet-tracker.jairuchan.com origin. CORS handling is here for the
+// fleet-tracker.jairukchan.com origin. CORS handling is here for the
 // localhost:3000 dev case and as defence against accidental
 // cross-origin requests.
 
 const CSP_HEADER =
   "default-src 'self'; " +
   "script-src 'self' https://maps.googleapis.com; " +
-  "connect-src 'self' wss://fleet-tracker.jairuchan.com https://maps.googleapis.com; " +
+  "connect-src 'self' wss://fleet-tracker.jairukchan.com https://maps.googleapis.com; " +
   "img-src 'self' data: https:; " +
   "style-src 'self' 'unsafe-inline'; " +
   "frame-ancestors 'none'; " +

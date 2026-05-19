@@ -32,7 +32,7 @@ const FLEET_HUB_ENTRY = `${HERE}/fleet-hub/src/fleet-hub.ts`
 const TEST_BINDINGS = {
   JWT_SECRET: 'test-jwt-secret-32-byte-random-hex',
   INTERNAL_PUBLISH_SECRET: 'test-internal-publish-secret',
-  ALLOWED_ORIGINS: 'http://localhost:3000,https://fleet-tracker.jairuchan.com',
+  ALLOWED_ORIGINS: 'http://localhost:3000,https://fleet-tracker.jairukchan.com',
 }
 
 export default defineConfig({

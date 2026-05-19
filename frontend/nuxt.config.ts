@@ -40,7 +40,7 @@ export default defineNuxtConfig({
   css: ['~/assets/css/tailwind.css'],
 
   // Single-origin deployment target: the whole site (frontend + /api/* + /ws/*)
-  // is fronted by a Cloudflare Worker at fleet-tracker.jairuchan.com. We use
+  // is fronted by a Cloudflare Worker at fleet-tracker.jairukchan.com. We use
   // the modern `cloudflare_module` preset (NOT cloudflare-pages).
   nitro: {
     preset: 'cloudflare_module',

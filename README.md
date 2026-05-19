@@ -2,7 +2,7 @@
 
 Real-time fleet tracking demo in Go (Fiber) and Nuxt 4 on the Cloudflare edge.
 
-> **Live demo at <https://fleet-tracker.jairuchan.com> runs until 2026-05-31.**
+> **Live demo at <https://fleet-tracker.jairukchan.com> runs until 2026-05-31.**
 > After that, the demo URL serves an `/expired` page and the production Container is scaled to zero. The source below stays available — see [Demo lifecycle](#demo-lifecycle) for the revival story.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -15,7 +15,7 @@ Real-time fleet tracking demo in Go (Fiber) and Nuxt 4 on the Cloudflare edge.
 
 ## Demo
 
-Visit <https://fleet-tracker.jairuchan.com> and sign in with the seeded credentials:
+Visit <https://fleet-tracker.jairukchan.com> and sign in with the seeded credentials:
 
 - **Manager** — `manager@demo.local` / `SeedPassword!1`
 - **Driver** — `driver@demo.local` / `SeedPassword!1`
@@ -37,7 +37,7 @@ graph TB
     subgraph Browser
         B[User Browser]
     end
-    subgraph Cloudflare["Cloudflare — single origin fleet-tracker.jairuchan.com"]
+    subgraph Cloudflare["Cloudflare — single origin fleet-tracker.jairukchan.com"]
         FW["Frontend Worker<br/>Nuxt 4 SSR"]
         GW["Gateway Worker<br/>routing + CSP"]
         DO["Durable Object<br/>FleetHub WS"]
@@ -59,7 +59,7 @@ graph TB
     C -->|"publish HMAC POST"| GW
 ```
 
-One hostname — `fleet-tracker.jairuchan.com` — fronts everything. The gateway Worker matches `/api/*` and `/ws/*` first; the frontend Worker catches everything else. That single-origin shape is the foundation for `SameSite=Lax` cookies, no CORS preflights, automatic cookie delivery on the WebSocket handshake, and a tight CSP. The deeper rationale lives in [ARCHITECTURE.md § Routing model](ARCHITECTURE.md#routing-model).
+One hostname — `fleet-tracker.jairukchan.com` — fronts everything. The gateway Worker matches `/api/*` and `/ws/*` first; the frontend Worker catches everything else. That single-origin shape is the foundation for `SameSite=Lax` cookies, no CORS preflights, automatic cookie delivery on the WebSocket handshake, and a tight CSP. The deeper rationale lives in [ARCHITECTURE.md § Routing model](ARCHITECTURE.md#routing-model).
 
 ---
 
@@ -100,7 +100,7 @@ One hostname — `fleet-tracker.jairuchan.com` — fronts everything. The gatewa
 
 ## API spec
 
-All routes live under `https://fleet-tracker.jairuchan.com`. Mutating routes (POST, PATCH, PUT, DELETE) require the double-submit CSRF header `X-CSRF-Token` in addition to the auth cookie.
+All routes live under `https://fleet-tracker.jairukchan.com`. Mutating routes (POST, PATCH, PUT, DELETE) require the double-submit CSRF header `X-CSRF-Token` in addition to the auth cookie.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
