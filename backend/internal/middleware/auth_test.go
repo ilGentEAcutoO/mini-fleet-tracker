@@ -262,6 +262,58 @@ func TestAuth_BlocklistError_500(t *testing.T) {
 	}
 }
 
+// TestAuth_BlocklistError_DoesNotLeakInfraError exercises the scrub-envelope
+// behaviour added by TASK-053 (security review M4). The middleware must log
+// the raw KV error server-side (operators can correlate via request_id) but
+// return only a generic "blocklist unavailable" envelope to the client.
+// Raw error text — which could carry CF account/namespace IDs in the wild —
+// must NOT appear in the response body.
+func TestAuth_BlocklistError_DoesNotLeakInfraError(t *testing.T) {
+	const sensitiveErrText = "cf-account abc123-namespace-ns_def456 connection reset"
+	signer := newTestSigner(t, time.Hour)
+	tok, _ := issueTestToken(t, signer, "drv_1", "driver")
+
+	bl := newStubBlocklist()
+	bl.err = errors.New(sensitiveErrText)
+
+	app := newAuthApp(t, signer, bl)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: AuthCookieName, Value: tok})
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+
+	body := readBody(t, resp)
+	if strings.Contains(body, sensitiveErrText) {
+		t.Fatalf("response body leaks raw KV error %q: body=%s", sensitiveErrText, body)
+	}
+	// Defensive: assert specific fragments that previously leaked.
+	for _, fragment := range []string{"cf-account", "namespace-ns_", "abc123", "def456", "connection reset"} {
+		if strings.Contains(body, fragment) {
+			t.Errorf("response body leaks infra fragment %q: body=%s", fragment, body)
+		}
+	}
+	// The envelope must still surface that the blocklist is the issue
+	// (generic message) so the SPA can retry intelligently.
+	var env map[string]any
+	if jerr := json.Unmarshal([]byte(body), &env); jerr != nil {
+		t.Fatalf("response body not JSON: %v; body=%s", jerr, body)
+	}
+	gotMsg, _ := env["message"].(string)
+	if !strings.Contains(strings.ToLower(gotMsg), "blocklist") || !strings.Contains(strings.ToLower(gotMsg), "unavailable") {
+		t.Errorf("message = %q, want a generic 'blocklist unavailable' envelope", gotMsg)
+	}
+	gotErr, _ := env["error"].(string)
+	if gotErr != "internal" {
+		t.Errorf("error code = %q, want %q", gotErr, "internal")
+	}
+}
+
 func TestAuth_NilVerifier_500(t *testing.T) {
 	// NewAuth returns a 500-emitting middleware (rather than panicking)
 	// when constructed with nil deps; this guards the wiring against

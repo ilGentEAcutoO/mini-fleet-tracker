@@ -3,9 +3,9 @@ package middleware
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog/log"
 
 	"github.com/ilGentEAcutoO/mini-fleet-tracker/backend/pkg/jwt"
 )
@@ -107,7 +107,21 @@ func NewAuth(verifier TokenVerifier, blocklist BlocklistChecker) fiber.Handler {
 			// A blocklist lookup failure must NOT fail-open — we treat it
 			// as a server error so the SPA surfaces a retry-friendly state
 			// rather than the caller silently riding a revoked token.
-			return respondAuthError(c, fiber.StatusInternalServerError, "internal", fmt.Sprintf("blocklist lookup: %s", err.Error()))
+			//
+			// Log the detailed error server-side (operators correlate via
+			// request_id) but return only a GENERIC envelope to the client.
+			// The raw error can carry CF account/namespace identifiers
+			// (cfclient.firstErrorMessage / readShort cap at 512 bytes but
+			// don't strip identifiers); leaking those into the response
+			// gives an unauthenticated caller cheap recon. Security review M4.
+			log.Warn().
+				Err(err).
+				Str("request_id", RequestIDFromCtx(c)).
+				Str("route", c.Path()).
+				Str("ip", c.IP()).
+				Str("jti", claims.JTI).
+				Msg("auth middleware: blocklist lookup failed")
+			return respondAuthError(c, fiber.StatusInternalServerError, "internal", "blocklist unavailable")
 		}
 		if revoked {
 			return respondAuthError(c, fiber.StatusUnauthorized, "unauthorized", "token revoked")
