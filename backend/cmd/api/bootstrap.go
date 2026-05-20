@@ -28,6 +28,16 @@ import (
 // is "time until victim notices and clicks logout", not the full hour.
 const accessTokenTTL = time.Hour
 
+// requestDeadline is the per-request context.WithTimeout budget every
+// handler inherits via middleware.RequestDeadline. 10s is the project's
+// agreed cap: longer than any healthy D1/KV/R2 round-trip (P99 ~1.5s)
+// and shorter than Fiber's ReadTimeout/WriteTimeout (15s) so context
+// cancellation always fires before the socket gives up. Tied to
+// TASK-062 / security review L5; bumping this requires re-tuning
+// downstream HTTP client timeouts in pkg/cfclient so they remain
+// strictly under the request deadline.
+const requestDeadline = 10 * time.Second
+
 // setupApp wires every dependency the API needs and returns a configured
 // Fiber app along with a cleanup function the caller must invoke on
 // shutdown. Errors here are programmer / operator errors (bad config,
@@ -348,6 +358,11 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	// so the panic-flow envelope still carries a valid request_id.
 	app.Use(middleware.RequestID())
 	app.Use(recover.New())
+	// RequestDeadline wraps UserContext with a 10s cap right after
+	// request_id so every downstream call inherits it. Placed BEFORE
+	// CORS and the logger so the logger's per-request scope sees the
+	// already-bounded context. TASK-062 / security review L5.
+	app.Use(middleware.RequestDeadline(requestDeadline))
 	app.Use(corsMiddleware)
 	app.Use(middleware.Logger())
 

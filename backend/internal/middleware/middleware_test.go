@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	fiberrecover "github.com/gofiber/fiber/v2/middleware/recover"
@@ -441,5 +442,112 @@ func TestJSONErrorHandler_NonFiberErrorBecomes500(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if strings.Contains(string(body), "non-fiber error from handler") {
 		t.Errorf("body must not leak the raw error message: %s", body)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TASK-062 — RequestDeadline middleware caps every request at 10s.
+// ---------------------------------------------------------------------------
+
+// TestRequestDeadline_TimesOutLongHandler — the 10s cap is the production
+// value; the test uses a much shorter timeout (200ms) so the unit suite
+// stays fast. The handler waits for up to 1s so a missing-deadline bug
+// surfaces as the handler completing successfully (status 200) and the
+// test failing with a wrong-status diagnostic.
+//
+// The handler intentionally observes ctx.Done() — production handlers
+// that ignore the context (a long CPU-bound loop with no syscalls) will
+// still complete after the cap is hit; the deadline only helps handlers
+// that propagate it. Fiber's ReadTimeout/WriteTimeout catches the
+// CPU-bound case at the socket level.
+func TestRequestDeadline_TimesOutLongHandler(t *testing.T) {
+	app := newTestApp()
+	app.Use(RequestID())
+	app.Use(RequestDeadline(200 * time.Millisecond))
+	app.Get("/slow", func(c *fiber.Ctx) error {
+		select {
+		case <-c.UserContext().Done():
+			return fiber.NewError(fiber.StatusGatewayTimeout, "request deadline exceeded")
+		case <-time.After(1 * time.Second):
+			return c.SendStatus(fiber.StatusOK)
+		}
+	})
+
+	start := time.Now()
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/slow", nil), 2_000)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("status = %d, want 504", resp.StatusCode)
+	}
+	// Should fire ~200ms in; allow generous slack for scheduler jitter
+	// on a busy CI runner.
+	if elapsed > 800*time.Millisecond {
+		t.Errorf("handler ran for %v; deadline should have fired by ~200ms", elapsed)
+	}
+}
+
+// TestRequestDeadline_FastHandlerPasses — sanity that the middleware does
+// not interfere with handlers that respond within the budget.
+func TestRequestDeadline_FastHandlerPasses(t *testing.T) {
+	app := newTestApp()
+	app.Use(RequestDeadline(500 * time.Millisecond))
+	app.Get("/fast", func(c *fiber.Ctx) error { return c.SendString("ok") })
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/fast", nil))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestRequestDeadline_PreservesParentContextValues — the wrapped context
+// must still carry whatever the upstream middleware put on UserContext
+// (request_id propagation, traces, etc). This catches the easy bug of
+// `context.WithTimeout(context.Background(), ...)` which would orphan
+// the upstream values.
+func TestRequestDeadline_PreservesParentContextValues(t *testing.T) {
+	type k string
+	const key k = "trace"
+
+	app := newTestApp()
+	app.Use(func(c *fiber.Ctx) error {
+		c.SetUserContext(context.WithValue(c.UserContext(), key, "carry-me"))
+		return c.Next()
+	})
+	app.Use(RequestDeadline(500 * time.Millisecond))
+	app.Get("/", func(c *fiber.Ctx) error {
+		if v, _ := c.UserContext().Value(key).(string); v != "carry-me" {
+			t.Errorf("upstream ctx value lost; got %q", v)
+		}
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	if _, err := app.Test(httptest.NewRequest(http.MethodGet, "/", nil)); err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+}
+
+// TestRequestDeadline_RejectsNonPositive — the constructor should fail
+// fast on zero/negative durations so bootstrap.go surfaces the bug at
+// boot, not silently disable the timeout.
+func TestRequestDeadline_RejectsNonPositive(t *testing.T) {
+	cases := []time.Duration{0, -1 * time.Second}
+	for _, d := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("RequestDeadline(%v) did not panic", d)
+				}
+			}()
+			_ = RequestDeadline(d)
+		}()
 	}
 }
