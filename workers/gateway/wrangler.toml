@@ -16,10 +16,17 @@ name = "FLEET_HUB"
 class_name = "FleetHub"
 script_name = "fleet-do-hub"
 
-routes = [
-  { pattern = "fleet-tracker.jairukchan.com/api/*", zone_name = "jairukchan.com" },
-  { pattern = "fleet-tracker.jairukchan.com/ws/*",  zone_name = "jairukchan.com" },
-]
+# `[[routes]]` table-array (not inline `routes = [...]`): an inline routes
+# array placed after a section header gets re-parented under that section
+# by the TOML parser and silently no-ops on deploy. Same gotcha documented
+# in frontend/wrangler.toml.
+[[routes]]
+pattern = "fleet-tracker.jairukchan.com/api/*"
+zone_name = "jairukchan.com"
+
+[[routes]]
+pattern = "fleet-tracker.jairukchan.com/ws/*"
+zone_name = "jairukchan.com"
 
 # Service binding to the fleet-api Container Worker — intra-CF, no DNS
 # hop, no loop-detection 404 that workers.dev URLs get when fetched from
