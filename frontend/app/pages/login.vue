@@ -36,11 +36,29 @@ const onSubmit = handleSubmit(async (values) => {
   try {
     await auth.login(values)
     // Honour `?redirect=` from the global middleware so a deep link survives
-    // the login bounce. Validate it starts with `/` to prevent open-redirect
-    // to an external attacker-controlled URL.
+    // the login bounce. Resolve the candidate against the current origin via
+    // the URL parser and only accept it when the resolved origin matches —
+    // this rejects open-redirect vectors that loose `startsWith('/')` checks
+    // miss, including:
+    //   * protocol-relative paths  `//evil.com/path`  (parses to evil.com)
+    //   * backslash variants       `/\evil.com/path`  (Chrome normalizes \\)
+    //   * full external URLs       `https://evil.com`
+    // SSR-safe: the `onSubmit` handler only fires after a user click, by
+    // which time we're guaranteed to be on the client and `location.origin`
+    // is defined.
     const raw = route.query.redirect
-    const redirect =
-      typeof raw === 'string' && raw.startsWith('/') ? raw : '/dashboard'
+    let redirect = '/dashboard'
+    if (typeof raw === 'string' && raw.startsWith('/')) {
+      try {
+        const candidate = new URL(raw, location.origin)
+        if (candidate.origin === location.origin) {
+          redirect = candidate.pathname + candidate.search + candidate.hash
+        }
+      }
+      catch {
+        // URL constructor threw — keep the safe default.
+      }
+    }
     await router.push(redirect)
   }
   catch (err: unknown) {
