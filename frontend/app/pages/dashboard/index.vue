@@ -17,7 +17,7 @@
 // (see backend/internal/handler/vehicle_handler.go:vehicleListBody), so the
 // fetch unwraps once and stores the bare array.
 
-import type { Vehicle } from '~~/shared/types/domain'
+import type { Vehicle, Position } from '~~/shared/types/domain'
 
 definePageMeta({ layout: 'default' })
 useHead({ title: 'Dashboard' })
@@ -50,9 +50,36 @@ async function fetchVehicles(): Promise<void> {
   }
 }
 
-onMounted(() => {
+// Pull the most-recent persisted position per vehicle so the map renders
+// markers on first paint even when no live WS frames have arrived in the
+// current session. Without this seed the map looks empty until a driver
+// reports — bad first impression for the demo audience.
+async function seedLatestPositions(): Promise<void> {
+  if (!auth.isManager) return
+  const since = Date.now() - 24 * 60 * 60 * 1000
+  await Promise.all(vehicles.value.map(async (v) => {
+    try {
+      const res = await api<{ positions: Position[] }>(
+        `/vehicles/${v.id}/positions?from=${since}&limit=1`,
+      )
+      const latest = res.positions[0]
+      // Skip if a WS frame has already populated this vehicle while we were
+      // fetching — the WS feed is the live truth.
+      if (latest && !fleet.positions.has(latest.vehicle_id)) {
+        fleet.positions.set(latest.vehicle_id, latest)
+      }
+    }
+    catch {
+      // Per-vehicle failures are non-fatal — the map can still show whatever
+      // other vehicles loaded successfully.
+    }
+  }))
+}
+
+onMounted(async () => {
   fleet.connect()
-  void fetchVehicles()
+  await fetchVehicles()
+  void seedLatestPositions()
 })
 
 onBeforeUnmount(() => {

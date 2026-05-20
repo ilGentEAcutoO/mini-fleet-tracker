@@ -30,68 +30,13 @@ const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 const formError = ref<string | null>(null)
-const demoSubmitting = ref<'manager' | 'driver' | null>(null)
 
-// Quick-fill demo accounts so a reviewer hitting the live URL can land on the
-// dashboard in one click instead of scraping creds from the README. These two
-// accounts come from `make seed` (manager + driver + 3 vehicles) and are
-// documented in README.md as intentionally-checked-in shared demo creds —
-// embedding them here is no incremental leak.
-const DEMO_CREDS = {
-  manager: { email: 'manager@demo.local', password: 'SeedPassword!1', landing: '/dashboard' },
-  driver: { email: 'driver@demo.local', password: 'SeedPassword!1', landing: '/driver/report' },
-} as const
-
-async function loginAsDemo(role: 'manager' | 'driver') {
-  if (demoSubmitting.value || isSubmitting.value) return
-  formError.value = null
-  demoSubmitting.value = role
-  const creds = DEMO_CREDS[role]
-  const apiBase = useRuntimeConfig().public.apiBase
-  // Two-step raw-fetch login + manual Pinia populate, then SPA nav. Why this
-  // shape instead of `auth.login()` + `router.push()`:
-  //
-  //   1. POST /auth/login responses from the CF Container intermittently arrive
-  //      with `content-encoding: zstd` and no terminating Content-Length on the
-  //      success path. `r.json()` then hangs on the body stream, so the Pinia
-  //      store never sees `user.value = u`. The Set-Cookie headers have already
-  //      landed by the time fetch resolves, so we skip reading the login body
-  //      entirely.
-  //   2. /auth/me's body stream is reliable, so we read the user record from
-  //      there and assign it onto the auth store directly. The middleware
-  //      reads `fetched` + `user` short-circuits the next push.
-  //   3. SPA `router.push` keeps the demo button feeling instant (no full
-  //      reload). A `window.location.assign` would bounce off the documented
-  //      SSR cookie-validation gap (todos.md / TASK-029 line 160).
-  try {
-    const loginResp = await fetch(`${apiBase}/auth/login`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: creds.email, password: creds.password }),
-    })
-    if (!loginResp.ok) {
-      formError.value = 'Demo sign-in failed. Please try again.'
-      demoSubmitting.value = null
-      return
-    }
-    const meResp = await fetch(`${apiBase}/auth/me`, { credentials: 'include' })
-    if (!meResp.ok) {
-      formError.value = 'Demo session check failed. Please try again.'
-      demoSubmitting.value = null
-      return
-    }
-    const meBody = (await meResp.json()) as { user: typeof auth.user }
-    auth.user = meBody.user
-    auth.fetched = true
-    await router.push(creds.landing)
-  }
-  catch (err: unknown) {
-    const e = err as { message?: string } | undefined
-    formError.value = e?.message ?? 'Demo sign-in failed. Please try again.'
-    demoSubmitting.value = null
-  }
-}
+// Demo quick-fill plumbing lives in composables/useDemoLogin.ts — same
+// implementation is reused from the landing page.
+const { loginAs: loginAsDemo, submitting: demoSubmitting, errorMessage: demoError } = useDemoLogin()
+watchEffect(() => {
+  if (demoError.value) formError.value = demoError.value
+})
 
 const onSubmit = handleSubmit(async (values) => {
   formError.value = null
