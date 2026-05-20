@@ -50,19 +50,6 @@ func TestNewDurableClient_RequiredFields(t *testing.T) {
 	}
 }
 
-// computeHMAC mirrors the client's signing so tests can verify the
-// signature byte-for-byte.
-//
-// LEGACY contract — body-only HMAC. Retained for the legacy-fallback
-// tests (the gateway + DO verifier accept both modes during the 24h
-// rollout window) but new tests should compose via computeHMACNew.
-func computeHMAC(t *testing.T, secret string, body []byte) string {
-	t.Helper()
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(body)
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
 // computeHMACNew mirrors the TASK-051 contract:
 //
 //	sig = HMAC-SHA256(body || '\n' || ts, secret)
