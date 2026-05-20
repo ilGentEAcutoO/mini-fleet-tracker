@@ -2,13 +2,16 @@ package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
+	fiberrecover "github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/rs/zerolog"
 )
 
@@ -313,5 +316,130 @@ func TestCORS_ActualRequestExposesRequestID(t *testing.T) {
 	expose := resp.Header.Get("Access-Control-Expose-Headers")
 	if !strings.Contains(expose, "X-Request-Id") {
 		t.Errorf("Expose-Headers = %q, want to contain X-Request-Id", expose)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TASK-061 — JSONErrorHandler wraps recovered panics + handler errors in
+// the standard {error, message, request_id} envelope.
+// ---------------------------------------------------------------------------
+
+// newPanicApp returns a Fiber app wired with the same chain bootstrap.go
+// uses: JSONErrorHandler at the fiber.Config level, then RequestID then
+// recover.New at the middleware level. The panic site is a /boom handler.
+func newPanicApp() *fiber.App {
+	app := fiber.New(fiber.Config{
+		DisableStartupMessage: true,
+		ErrorHandler:          JSONErrorHandler,
+	})
+	app.Use(RequestID())
+	app.Use(fiberrecover.New())
+	app.Get("/boom", func(c *fiber.Ctx) error {
+		panic("kaboom: simulated panic inside handler")
+	})
+	app.Get("/fiber-error", func(c *fiber.Ctx) error {
+		return fiber.NewError(http.StatusBadGateway, "upstream broken")
+	})
+	app.Get("/plain-error", func(c *fiber.Ctx) error {
+		return errors.New("non-fiber error from handler")
+	})
+	return app
+}
+
+// TestJSONErrorHandler_PanicYieldsStandardEnvelope is the headline TASK-061
+// guard rail: a handler panic must surface as a JSON envelope with status
+// 500, not Fiber's default text/plain stack-trace dump. Without this, the
+// SPA's error-toast pipeline fails to parse and the user sees nothing
+// useful while operators lose the request_id correlation.
+func TestJSONErrorHandler_PanicYieldsStandardEnvelope(t *testing.T) {
+	app := newPanicApp()
+	req := httptest.NewRequest(http.MethodGet, "/boom", nil)
+	req.Header.Set(RequestIDHeader, "panic-test-rid-1")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", resp.StatusCode)
+	}
+	if ct := resp.Header.Get(fiber.HeaderContentType); !strings.HasPrefix(ct, fiber.MIMEApplicationJSON) {
+		t.Errorf("Content-Type = %q, want application/json prefix", ct)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var env map[string]any
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("body is not JSON: %v\nbody=%s", err, body)
+	}
+	if env["error"] != "internal" {
+		t.Errorf("error field = %v, want internal", env["error"])
+	}
+	if env["message"] != "internal server error" {
+		t.Errorf("message field = %v, want generic placeholder", env["message"])
+	}
+	if env["request_id"] != "panic-test-rid-1" {
+		t.Errorf("request_id field = %v, want passthrough panic-test-rid-1", env["request_id"])
+	}
+	// Stack traces must NOT leak to clients — operators see them server-side
+	// via recover's default StackTraceHandler.
+	if strings.Contains(string(body), "kaboom") || strings.Contains(string(body), "goroutine") {
+		t.Errorf("body must not leak panic payload or stack trace: %s", body)
+	}
+}
+
+// TestJSONErrorHandler_FiberErrorRetainsStatus proves fiber.NewError(code,
+// msg) keeps the explicit status — needed because the recover middleware
+// turns recovered panics into anonymous errors, but real handlers that
+// return *fiber.Error want their own code respected (404, 502, etc).
+func TestJSONErrorHandler_FiberErrorRetainsStatus(t *testing.T) {
+	app := newPanicApp()
+	req := httptest.NewRequest(http.MethodGet, "/fiber-error", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var env map[string]any
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("body is not JSON: %v\nbody=%s", err, body)
+	}
+	// fiber.Error.Message *can* be surfaced because the handler chose it —
+	// unlike a panic (uncontrolled origin) the message is a deliberate
+	// choice from the developer.
+	if env["message"] != "upstream broken" {
+		t.Errorf("message = %v, want upstream broken", env["message"])
+	}
+	if env["error"] != "internal" {
+		t.Errorf("error code = %v, want internal", env["error"])
+	}
+}
+
+// TestJSONErrorHandler_NonFiberErrorBecomes500 — a plain `errors.New` from
+// a handler is treated as a 500 because we don't know what status the
+// developer intended. The message stays generic to avoid leaking error
+// strings that may carry internal details (DB row IDs, etc).
+func TestJSONErrorHandler_NonFiberErrorBecomes500(t *testing.T) {
+	app := newPanicApp()
+	req := httptest.NewRequest(http.MethodGet, "/plain-error", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "non-fiber error from handler") {
+		t.Errorf("body must not leak the raw error message: %s", body)
 	}
 }

@@ -333,10 +333,21 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 		EnableTrustedProxyCheck: true,
 		TrustedProxies:          []string{"0.0.0.0/0", "::/0"},
 		ProxyHeader:             "CF-Connecting-IP",
+		// JSONErrorHandler wraps every handler-returned error AND every
+		// recovered panic in the standard {error, message, request_id}
+		// envelope. Without this Fiber's default sends text/plain on
+		// panic, which breaks the SPA's error-toast pipeline and erases
+		// the request_id correlation operators rely on. TASK-061 /
+		// security review L4.
+		ErrorHandler: middleware.JSONErrorHandler,
 	})
 
-	app.Use(recover.New())
+	// recover.New() catches handler panics and surfaces them as returned
+	// errors. Fiber then routes the error through ErrorHandler above,
+	// which produces the JSON envelope. RequestID() runs BEFORE recover
+	// so the panic-flow envelope still carries a valid request_id.
 	app.Use(middleware.RequestID())
+	app.Use(recover.New())
 	app.Use(corsMiddleware)
 	app.Use(middleware.Logger())
 
