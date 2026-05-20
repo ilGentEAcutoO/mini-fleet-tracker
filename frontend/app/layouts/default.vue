@@ -31,67 +31,86 @@ async function signOut(): Promise<void> {
         <NuxtLink to="/" class="font-semibold tracking-tight">
           Mini Fleet Tracker
         </NuxtLink>
-        <nav
-          v-if="auth.isAuthenticated"
-          class="hidden md:flex items-center gap-4 text-sm"
-        >
-          <NuxtLink
-            to="/dashboard"
-            active-class="text-foreground font-medium"
-            class="text-muted-foreground hover:text-foreground transition-colors"
+        <ClientOnly>
+          <nav
+            v-if="auth.isAuthenticated"
+            class="hidden md:flex items-center gap-4 text-sm"
           >
-            Dashboard
-          </NuxtLink>
-          <NuxtLink
-            v-if="auth.isManager"
-            to="/dashboard/vehicles"
-            active-class="text-foreground font-medium"
-            class="text-muted-foreground hover:text-foreground transition-colors"
-          >
-            Vehicles
-          </NuxtLink>
-          <NuxtLink
-            v-if="auth.user?.role === 'driver'"
-            to="/driver/report"
-            active-class="text-foreground font-medium"
-            class="text-muted-foreground hover:text-foreground transition-colors"
-          >
-            Report
-          </NuxtLink>
-        </nav>
-        <div class="ml-auto flex items-center gap-3 text-sm">
-          <template v-if="auth.isAuthenticated">
-            <span
-              class="hidden sm:inline text-xs text-muted-foreground"
-              :title="auth.user?.email"
+            <NuxtLink
+              to="/dashboard"
+              active-class="text-foreground font-medium"
+              class="text-muted-foreground hover:text-foreground transition-colors"
             >
-              {{ auth.user?.email }}
-            </span>
-            <Button
-              variant="outline"
-              size="sm"
-              @click="signOut"
-            >
-              Sign out
-            </Button>
-          </template>
-          <template v-else>
-            <NuxtLink to="/login" class="text-muted-foreground hover:text-foreground">
-              Sign in
+              Dashboard
             </NuxtLink>
             <NuxtLink
-              to="/register"
-              class="text-muted-foreground hover:text-foreground"
+              v-if="auth.isManager"
+              to="/dashboard/vehicles"
+              active-class="text-foreground font-medium"
+              class="text-muted-foreground hover:text-foreground transition-colors"
             >
-              Register
+              Vehicles
             </NuxtLink>
+            <NuxtLink
+              v-if="auth.user?.role === 'driver'"
+              to="/driver/report"
+              active-class="text-foreground font-medium"
+              class="text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Report
+            </NuxtLink>
+          </nav>
+        </ClientOnly>
+        <ClientOnly>
+          <template #fallback>
+            <div class="ml-auto flex items-center gap-3 text-sm">
+              <NuxtLink to="/login" class="text-muted-foreground hover:text-foreground">
+                Sign in
+              </NuxtLink>
+              <NuxtLink
+                to="/register"
+                class="text-muted-foreground hover:text-foreground"
+              >
+                Register
+              </NuxtLink>
+            </div>
           </template>
-        </div>
+          <div class="ml-auto flex items-center gap-3 text-sm">
+            <template v-if="auth.isAuthenticated">
+              <span
+                class="hidden sm:inline text-xs text-muted-foreground"
+                :title="auth.user?.email"
+              >
+                {{ auth.user?.email }}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                @click="signOut"
+              >
+                Sign out
+              </Button>
+            </template>
+            <template v-else>
+              <NuxtLink to="/login" class="text-muted-foreground hover:text-foreground">
+                Sign in
+              </NuxtLink>
+              <NuxtLink
+                to="/register"
+                class="text-muted-foreground hover:text-foreground"
+              >
+                Register
+              </NuxtLink>
+            </template>
+          </div>
+        </ClientOnly>
       </div>
     </header>
     <main class="container mx-auto px-4 py-8">
       <slot />
     </main>
-    <Sonner position="top-right" :rich-colors="true" />
+    <ClientOnly>
+      <Sonner position="top-right" :rich-colors="true" />
+    </ClientOnly>
   </div>
 </template>

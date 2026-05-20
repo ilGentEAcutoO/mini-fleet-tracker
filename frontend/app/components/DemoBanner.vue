@@ -14,18 +14,19 @@
 //     who lands on a non-`/expired` page after expiry sees this
 //     immediately, even before any API call would redirect them.
 //
-// The cutoff is constructed at module load. SSR + hydration both see the
-// same numerical comparison (no `client-only` wrapper needed); a small
-// risk of hydration mismatch exists if the SSR render straddles the
-// cutoff to the millisecond, which is a non-issue in practice.
+// SSR + client share the same `now` via Nuxt's `useState` so the integer
+// day count never drifts between the two renders. Without this, the SSR
+// render and the hydration tick can compute different `daysLeft` values
+// (e.g. across a midnight boundary or with a multi-second cold-start)
+// and Vue logs "Hydration completed but contains mismatches".
 
 const expiresAt = new Date('2026-05-31T23:59:59+07:00')
-const now = new Date()
-const msLeft = expiresAt.getTime() - now.getTime()
-const daysLeft = Math.floor(msLeft / (24 * 60 * 60 * 1000))
+const nowMs = useState('demo-banner-now', () => Date.now())
+const msLeft = computed(() => expiresAt.getTime() - nowMs.value)
+const daysLeft = computed(() => Math.floor(msLeft.value / (24 * 60 * 60 * 1000)))
 
-const visible = daysLeft >= 0 && daysLeft <= 7
-const expired = msLeft < 0
+const visible = computed(() => daysLeft.value >= 0 && daysLeft.value <= 7)
+const expired = computed(() => msLeft.value < 0)
 </script>
 
 <template>
