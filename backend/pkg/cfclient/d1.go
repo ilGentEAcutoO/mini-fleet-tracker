@@ -413,6 +413,16 @@ func sortStrings(s []string) {
 // assignD1Value copies a single JSON-decoded value into a typed pointer.
 // D1 only ever returns SQLite-flavoured primitives (TEXT, INTEGER, REAL,
 // BLOB, NULL), so the supported dest types are intentionally narrow.
+//
+// Nullable columns use the pointer-to-pointer idiom (**string, **int64,
+// **float64) — the same convention database/sql callers reach for when
+// they need to distinguish SQL NULL from the zero value of the
+// underlying type. backend/internal/repository/d1/vehicle_repo.go:40-42
+// is the canonical motivating call site: `var driverID, model *string`
+// then `rows.Scan(..., &driverID, &model, ...)` — Scan sees **string,
+// writes nil on NULL or a freshly-allocated *string on a real value,
+// and the caller can branch on `if driverID != nil` without a separate
+// "is this column NULL" probe.
 func assignD1Value(dest, src any) error {
 	switch d := dest.(type) {
 	case *string:
@@ -459,6 +469,36 @@ func assignD1Value(dest, src any) error {
 			*d = false
 		default:
 			return fmt.Errorf("cannot assign %T to *bool", src)
+		}
+	case **string:
+		switch v := src.(type) {
+		case string:
+			cp := v
+			*d = &cp
+		case nil:
+			*d = nil
+		default:
+			return fmt.Errorf("cannot assign %T to **string", src)
+		}
+	case **int64:
+		switch v := src.(type) {
+		case float64:
+			cp := int64(v)
+			*d = &cp
+		case nil:
+			*d = nil
+		default:
+			return fmt.Errorf("cannot assign %T to **int64", src)
+		}
+	case **float64:
+		switch v := src.(type) {
+		case float64:
+			cp := v
+			*d = &cp
+		case nil:
+			*d = nil
+		default:
+			return fmt.Errorf("cannot assign %T to **float64", src)
 		}
 	case *any:
 		*d = src
