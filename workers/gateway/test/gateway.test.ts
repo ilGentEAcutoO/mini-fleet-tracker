@@ -65,6 +65,27 @@ describe('gateway helpers', () => {
     expect(originIsAllowed('http://localhost:3000', env.ALLOWED_ORIGINS)).toBe(true)
     expect(originIsAllowed('https://attacker.example', env.ALLOWED_ORIGINS)).toBe(false)
   })
+
+  // Single-origin posture per ARCHITECTURE.md + security-review.md M1
+  // (cross-cutting). The gateway's wrangler.toml ALLOWED_ORIGINS must
+  // match exactly the trimmed canonical pair — the workers.dev preview
+  // URL was removed in TASK-048 because neither fleet-hub DO nor the
+  // backend's CORS_ORIGIN accepted that origin; keeping the gateway more
+  // lenient was inconsistent with the documented posture.
+  it('originIsAllowed rejects the workers.dev preview origin under the canonical trimmed allow-list', () => {
+    const canonicalAllowList = 'http://localhost:3000,https://fleet-tracker.jairukchan.com'
+    expect(
+      originIsAllowed(
+        'https://fleet-worker-gateway.sornwin.workers.dev',
+        canonicalAllowList,
+      ),
+    ).toBe(false)
+    // Positive control: the two canonical origins ARE allowed.
+    expect(originIsAllowed('http://localhost:3000', canonicalAllowList)).toBe(true)
+    expect(
+      originIsAllowed('https://fleet-tracker.jairukchan.com', canonicalAllowList),
+    ).toBe(true)
+  })
 })
 
 // ============================================================================
@@ -101,6 +122,25 @@ describe('CORS preflight', () => {
       method: 'OPTIONS',
     })
     expect(res.status).toBe(403)
+  })
+
+  // TASK-048: the workers.dev preview origin used to be accepted by the
+  // gateway only (fleet-hub DO + Go backend CORS_ORIGIN never accepted
+  // it). The trimmed allow-list in wrangler.toml + the matching
+  // TEST_BINDINGS in vitest.config.ts both reject it.
+  it('returns 403 + no allow-origin header for the workers.dev preview origin', async () => {
+    const previewOrigin = 'https://fleet-worker-gateway.sornwin.workers.dev'
+    const res = await SELF.fetch('https://gateway.example/api/auth/me', {
+      method: 'OPTIONS',
+      headers: {
+        Origin: previewOrigin,
+        'Access-Control-Request-Method': 'GET',
+        'Access-Control-Request-Headers': 'Content-Type',
+      },
+    })
+    expect(res.status).toBe(403)
+    // Critical: must NEVER echo the preview origin back.
+    expect(res.headers.get('Access-Control-Allow-Origin')).not.toBe(previewOrigin)
   })
 })
 
