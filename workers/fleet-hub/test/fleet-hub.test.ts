@@ -531,3 +531,121 @@ describe('demo expiration', () => {
     expect(res.status).toBe(405)
   })
 })
+
+// ============================================================================
+// TASK-051 — HMAC replay protection (DO side, fallback mode).
+//
+// The new signed envelope is HMAC-SHA256(body || '\n' || ts, secret) with an
+// X-Timestamp header and a ±30s window. While the Go publisher is being
+// rolled out, the DO must keep accepting the legacy body-only signature so
+// in-flight events from an older publisher don't drop. The fallback is
+// "if no X-Timestamp AND the new check would not have applied" → legacy.
+//
+// Bytes-identical contract with the gateway verifier (Bravo-2):
+//   * separator is the single byte '\n' (0x0a)
+//   * UTF-8 encoding for both body and ts
+//   * lowercase hex output
+//   * constant-time compare via timingSafeEqualHex
+// ============================================================================
+
+describe('FleetHub /publish — HMAC replay protection (TASK-051)', () => {
+  // Sign the new envelope: HMAC over `body + '\n' + ts` (UTF-8).
+  async function signBodyAndTs(
+    secret: string,
+    body: string,
+    ts: string,
+  ): Promise<string> {
+    return hmacSha256Hex(secret, new TextEncoder().encode(body + '\n' + ts))
+  }
+
+  it('accepts the new format inside the ±30s window (204)', async () => {
+    // The DO checks `Math.abs(Date.now()/1000 - ts) <= 30`. Stamp now.
+    const ts = String(Math.floor(Date.now() / 1000))
+    const body = JSON.stringify({
+      type: 'position.update',
+      vehicle_id: 'v-new',
+      lat: 13.7,
+      lng: 100.5,
+      recorded_at: 1716000000,
+    })
+    const sig = await signBodyAndTs(INTERNAL_PUBLISH_SECRET, body, ts)
+    const res = await SELF.fetch('https://test.example/publish', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
+      body,
+    })
+    expect(res.status).toBe(204)
+  })
+
+  it('rejects the new format outside the ±30s window (401)', async () => {
+    // 5 minutes in the past — well outside ±30s. Even with a valid signature
+    // over `body || \n || ts` for that ts, the DO refuses because the window
+    // closed. Without an X-Timestamp the legacy check would run; here ts is
+    // present so we don't fall back.
+    const ts = String(Math.floor(Date.now() / 1000) - 300)
+    const body = JSON.stringify({
+      type: 'position.update',
+      vehicle_id: 'v-stale',
+      lat: 1,
+      lng: 2,
+      recorded_at: 1,
+    })
+    const sig = await signBodyAndTs(INTERNAL_PUBLISH_SECRET, body, ts)
+    const res = await SELF.fetch('https://test.example/publish', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
+      body,
+    })
+    expect(res.status).toBe(401)
+  })
+
+  it('accepts the legacy body-only signature without X-Timestamp (204)', async () => {
+    // Pre-rollout publisher still sends body-only HMAC. Fallback kicks in.
+    const body = JSON.stringify({
+      type: 'position.update',
+      vehicle_id: 'v-legacy',
+      lat: 1,
+      lng: 2,
+      recorded_at: 1,
+    })
+    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body) // body-only
+    const res = await SELF.fetch('https://test.example/publish', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+      },
+      body,
+    })
+    expect(res.status).toBe(204)
+  })
+
+  it('rejects when both new and legacy checks fail (401)', async () => {
+    // Garbage signature, no timestamp, valid body. Both verification paths
+    // reject; the DO must respond 401.
+    const body = JSON.stringify({
+      type: 'position.update',
+      vehicle_id: 'v-bad',
+      lat: 1,
+      lng: 2,
+      recorded_at: 1,
+    })
+    const res = await SELF.fetch('https://test.example/publish', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': 'deadbeef'.repeat(8), // 64 chars, wrong
+      },
+      body,
+    })
+    expect(res.status).toBe(401)
+  })
+})

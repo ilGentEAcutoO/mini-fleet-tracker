@@ -99,9 +99,17 @@ export class FleetHub extends DurableObject<Env> {
 
   // POST /publish — HMAC-gated event ingestion.
   //
-  // The gateway forwards Go's signed body untouched. We re-compute the
-  // HMAC over the raw bytes and compare via constant-time. On success we
-  // broadcast the event to every currently-connected WebSocket.
+  // The gateway forwards Go's signed body untouched. We verify the HMAC
+  // via verifyPublishHMAC which supports two payload formats:
+  //   * NEW (TASK-051): HMAC over `body || '\n' || ts`, with a ±30s
+  //     window enforced against `X-Timestamp`. Blocks replay of captured
+  //     signed requests past the window.
+  //   * LEGACY: HMAC over body only. Kept active for ~24h after the
+  //     publisher rolls out so any in-flight event from an older
+  //     Container instance still lands.
+  // The verifier logs whenever the legacy path is taken so operators can
+  // watch the rollout drain and flip the flag off once the rate is zero.
+  // On success we broadcast the event to every currently-connected WS.
   private async handlePublish(req: Request): Promise<Response> {
     if (req.method !== 'POST') {
       return new Response('method not allowed', { status: 405 })
@@ -122,9 +130,21 @@ export class FleetHub extends DurableObject<Env> {
 
     // arrayBuffer() consumes the body once; we recover the JSON below.
     const bodyBytes = new Uint8Array(await req.arrayBuffer())
-    const expected = await hmacSha256Hex(this.env.INTERNAL_PUBLISH_SECRET, bodyBytes)
-    if (!timingSafeEqualHex(sigHeader, expected)) {
+    const tsHeader = req.headers.get('X-Timestamp')
+    const verdict = await verifyPublishHMAC(
+      bodyBytes,
+      sigHeader,
+      tsHeader,
+      this.env.INTERNAL_PUBLISH_SECRET,
+    )
+    if (!verdict.ok) {
       return new Response('bad signature', { status: 401 })
+    }
+    if (verdict.mode === 'legacy') {
+      // Operational signal — when this rate drops to zero in production
+      // logs, TASK-051's rollout is complete and the legacy branch can be
+      // removed. Kept at info level: not an error, just a transition.
+      console.info('fleet-hub: /publish accepted via legacy body-only HMAC')
     }
 
     // Parse only after the signature is verified — we don't want to leak
@@ -269,6 +289,69 @@ export function timingSafeEqualHex(a: string, b: string): boolean {
     mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i)
   }
   return mismatch === 0
+}
+
+// verifyPublishHMAC enforces the TASK-051 replay-protection contract on
+// /internal/publish. The new envelope is `HMAC-SHA256(body || '\n' || ts,
+// secret)` with `X-Timestamp` carrying the unix-seconds string. We accept
+// it only when `|now - ts| <= 30s`. If no timestamp is present (or if
+// the new check declined), we fall through to the legacy body-only
+// signature so events from a pre-rollout publisher still land.
+//
+// Bytes-identical to the gateway's verifier (workers/gateway/src/index.ts).
+// Both ends MUST agree on:
+//   * separator '\n' (UTF-8 single byte 0x0a)
+//   * lowercase hex output from hmacSha256Hex
+//   * constant-time compare via timingSafeEqualHex
+// Diverging on any of these silently breaks the verifier without a clear
+// failure mode at deploy time — a regression caught only by integration
+// tests that drive the publisher through the gateway end-to-end.
+//
+// The `mode` field on a successful verdict lets the caller log when the
+// legacy path was taken so the rollout drain is observable. Logging is
+// the caller's job — this helper stays pure for testability.
+export async function verifyPublishHMAC(
+  body: Uint8Array,
+  signature: string,
+  ts: string | null,
+  secret: string,
+): Promise<{ ok: true; mode: 'new' | 'legacy' } | { ok: false; mode: 'new' }> {
+  // Try the new format first when a timestamp is present. Parse defensively
+  // — a non-numeric header is treated as missing and we fall through to
+  // legacy. Number.isFinite rejects NaN, +Inf, -Inf which all coerce from
+  // string forms that would otherwise pass `!Number.isNaN`.
+  if (ts !== null) {
+    const tsNum = Number.parseInt(ts, 10)
+    if (Number.isFinite(tsNum)) {
+      const nowSec = Date.now() / 1000
+      const skew = Math.abs(nowSec - tsNum)
+      if (skew <= 30) {
+        // Build `body + '\n' + ts` as a single byte buffer. Encoding ts
+        // separately as UTF-8 keeps the byte layout identical to a
+        // Go-side `append(body, '\n'); append(body, []byte(ts))`.
+        const tsBytes = new TextEncoder().encode('\n' + ts)
+        const combined = new Uint8Array(body.length + tsBytes.length)
+        combined.set(body, 0)
+        combined.set(tsBytes, body.length)
+        const expected = await hmacSha256Hex(secret, combined)
+        if (timingSafeEqualHex(signature, expected)) {
+          return { ok: true, mode: 'new' }
+        }
+      }
+    }
+  }
+
+  // Legacy fallback: HMAC over body only. This is the contract that
+  // shipped before TASK-051 — we keep it active during rollout so
+  // unsigned-timestamp events from an older Container instance still
+  // verify. Once the publisher upgrade is complete and the legacy log
+  // line stops appearing in prod, this branch can be removed.
+  const expectedLegacy = await hmacSha256Hex(secret, body)
+  if (timingSafeEqualHex(signature, expectedLegacy)) {
+    return { ok: true, mode: 'legacy' }
+  }
+
+  return { ok: false, mode: 'new' }
 }
 
 // HMAC-SHA256(message, secret) → lowercase hex string. Uses SubtleCrypto,
