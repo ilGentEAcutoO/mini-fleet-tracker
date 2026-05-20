@@ -30,6 +30,35 @@ const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 const formError = ref<string | null>(null)
+const demoSubmitting = ref<'manager' | 'driver' | null>(null)
+
+// Quick-fill demo accounts so a reviewer hitting the live URL can land on the
+// dashboard in one click instead of scraping creds from the README. These two
+// accounts come from `make seed` (manager + driver + 3 vehicles) and are
+// documented in README.md as intentionally-checked-in shared demo creds —
+// embedding them here is no incremental leak.
+const DEMO_CREDS = {
+  manager: { email: 'manager@demo.local', password: 'SeedPassword!1', landing: '/dashboard' },
+  driver: { email: 'driver@demo.local', password: 'SeedPassword!1', landing: '/driver/report' },
+} as const
+
+async function loginAsDemo(role: 'manager' | 'driver') {
+  if (demoSubmitting.value || isSubmitting.value) return
+  formError.value = null
+  demoSubmitting.value = role
+  const creds = DEMO_CREDS[role]
+  try {
+    await auth.login({ email: creds.email, password: creds.password })
+    await router.push(creds.landing)
+  }
+  catch (err: unknown) {
+    const e = err as { data?: { message?: string } } | undefined
+    formError.value = e?.data?.message ?? 'Demo sign-in failed. Please try again.'
+  }
+  finally {
+    demoSubmitting.value = null
+  }
+}
 
 const onSubmit = handleSubmit(async (values) => {
   formError.value = null
@@ -82,6 +111,38 @@ const onSubmit = handleSubmit(async (values) => {
         </CardDescription>
       </CardHeader>
       <CardContent>
+        <div class="space-y-2 mb-4">
+          <Button
+            type="button"
+            variant="secondary"
+            class="w-full"
+            :disabled="!!demoSubmitting || isSubmitting"
+            data-testid="try-demo-manager"
+            @click="loginAsDemo('manager')"
+          >
+            {{ demoSubmitting === 'manager' ? 'Signing in…' : 'Try as Manager (demo)' }}
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            class="w-full"
+            :disabled="!!demoSubmitting || isSubmitting"
+            data-testid="try-demo-driver"
+            @click="loginAsDemo('driver')"
+          >
+            {{ demoSubmitting === 'driver' ? 'Signing in…' : 'Try as Driver (demo)' }}
+          </Button>
+        </div>
+        <div class="relative my-4">
+          <div class="absolute inset-0 flex items-center" aria-hidden="true">
+            <span class="w-full border-t" />
+          </div>
+          <div class="relative flex justify-center text-xs uppercase">
+            <span class="bg-card px-2 text-muted-foreground">
+              or sign in manually
+            </span>
+          </div>
+        </div>
         <form class="space-y-4" @submit="onSubmit">
           <div class="space-y-1">
             <Label for="email">Email</Label>
