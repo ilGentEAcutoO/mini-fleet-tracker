@@ -119,6 +119,17 @@ func (h *PhotoHandler) Presign(c *fiber.Ctx) error {
 				Message:   "Daily upload limit reached for this vehicle. Try again tomorrow.",
 				RequestID: middleware.RequestIDFromCtx(c),
 			})
+		case errors.Is(err, domain.ErrUnavailable):
+			// 503 + Retry-After when the fail-closed quota path trips
+			// (TASK-052 / M2). The SPA's retryable-error pill engages
+			// and a transient KV outage drains within seconds in
+			// practice, so the user-visible cost is one retry.
+			c.Set(fiber.HeaderRetryAfter, "5")
+			return c.Status(http.StatusServiceUnavailable).JSON(errorBody{
+				Error:     "service_unavailable",
+				Message:   "Photo quota storage temporarily unavailable; please retry.",
+				RequestID: middleware.RequestIDFromCtx(c),
+			})
 		default:
 			return h.respondError(c, http.StatusInternalServerError, "internal", "could not presign upload")
 		}

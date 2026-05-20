@@ -45,4 +45,13 @@ var (
 	// ErrTooMany is returned when a rate-limit or quota guardrail trips.
 	// The HTTP layer maps this onto 429 Too Many Requests.
 	ErrTooMany = errors.New("too many requests")
+
+	// ErrUnavailable is returned when a transient infrastructure failure
+	// (KV outage, D1 hiccup) prevents a request from being served safely.
+	// Critically used by fail-closed code paths where admitting the
+	// request would weaken a security guarantee — see PhotoUsecase's
+	// quota increment (TASK-052 / security review M2). The HTTP layer
+	// maps this onto 503 Service Unavailable with a Retry-After header
+	// so SPAs surface a retryable-error state rather than a permanent one.
+	ErrUnavailable = errors.New("service unavailable")
 )

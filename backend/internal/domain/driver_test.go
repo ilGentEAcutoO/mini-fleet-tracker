@@ -42,6 +42,7 @@ func TestSentinelErrors_AreDistinct(t *testing.T) {
 		"ErrForbidden":     domain.ErrForbidden,
 		"ErrValidation":    domain.ErrValidation,
 		"ErrTooMany":       domain.ErrTooMany,
+		"ErrUnavailable":   domain.ErrUnavailable,
 	}
 	for nameA, a := range sentinels {
 		for nameB, b := range sentinels {
@@ -66,6 +67,7 @@ func TestSentinelErrors_AreWrappable(t *testing.T) {
 		domain.ErrForbidden,
 		domain.ErrValidation,
 		domain.ErrTooMany,
+		domain.ErrUnavailable,
 	} {
 		wrapped := fmt.Errorf("context: %w", sentinel)
 		if !errors.Is(wrapped, sentinel) {

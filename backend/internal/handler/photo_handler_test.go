@@ -239,6 +239,38 @@ func TestPhotoPresign_QuotaExceeded_429(t *testing.T) {
 	}
 }
 
+// TestPhotoPresign_QuotaStorageDown_503 pins TASK-052 / security review M2.
+// When the usecase returns domain.ErrUnavailable (the fail-closed branch
+// in PhotoUsecase.PresignUpload after a writeQuota error) the handler
+// must emit 503 + Retry-After with a service_unavailable code so the
+// SPA's retryable-error pill engages.
+func TestPhotoPresign_QuotaStorageDown_503(t *testing.T) {
+	uc := &programmablePhotoUsecase{
+		presignFn: func(_ context.Context, _, _, _ string) (*usecase.PresignUploadOutput, error) {
+			return nil, fmt.Errorf("kv write blew up: %w", domain.ErrUnavailable)
+		},
+	}
+	h := newPhotoHarness(t, uc)
+	cookie := h.issueCookie(t, "mgr-001", "manager")
+	req := photoReq(t, http.MethodPost, "/api/vehicles/veh-001/photos:presign",
+		map[string]string{"filename": "x.jpg"}, cookie)
+
+	resp, err := h.app.Test(req)
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", resp.StatusCode, readBody(t, resp))
+	}
+	if ra := resp.Header.Get(fiber.HeaderRetryAfter); ra == "" {
+		t.Errorf("Retry-After header missing on 503")
+	}
+	body := readBody(t, resp)
+	if !strings.Contains(body, `"error":"service_unavailable"`) {
+		t.Errorf("body missing service_unavailable code: %s", body)
+	}
+}
+
 func TestPhotoPresign_VehicleNotFound_404(t *testing.T) {
 	uc := &programmablePhotoUsecase{
 		presignFn: func(_ context.Context, _, _, _ string) (*usecase.PresignUploadOutput, error) {

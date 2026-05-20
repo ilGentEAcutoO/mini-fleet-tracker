@@ -436,13 +436,22 @@ func TestPhotoUsecase_PresignUpload_ValidationBranches(t *testing.T) {
 	}
 }
 
-// quotaIncrementFailureSemantics documents the "best-effort increment"
-// choice: a Put failure logs a warn and still returns the URL. The
-// quota counter therefore under-counts by at most one transient KV
-// hiccup, with no false-positive 429s. The alternative (fail-closed on
-// Put error) would deny legitimate uploads during KV flakes, which is a
-// worse trade for a demo.
-func TestPhotoUsecase_PresignUpload_QuotaIncrementFailureIsBestEffort(t *testing.T) {
+// TestPhotoUsecase_PresignUpload_QuotaIncrementFailureIsFailClosed pins
+// TASK-052 / security review M2. Before, a Put failure logged a warn
+// and STILL returned the URL — meaning a KV outage let an attacker
+// burst far past the daily-3 cap because every retry re-minted a fresh
+// presigned URL while the counter stayed stuck. The new contract:
+// writeQuota error → return domain.ErrUnavailable so the handler
+// surfaces 503 + Retry-After and the client retries instead of bursting
+// uploads through an uncounted gap.
+//
+// The presigned URL itself is minted before the write — that's fine
+// because it never reaches the client when we return an error, and
+// PresignPutObject doesn't reserve R2 capacity (it's pure SigV4
+// cryptography). A future Option B (atomic FleetQuota DO) lands the
+// increment + sign in one RPC; until then fail-CLOSED is the correct
+// trade for a 5MB-per-upload, cost-bounded demo.
+func TestPhotoUsecase_PresignUpload_QuotaIncrementFailureIsFailClosed(t *testing.T) {
 	pres := newMemPresigner()
 	qs := newMemQuotaStore()
 	qs.putErr = errors.New("kv put 500")
@@ -453,15 +462,18 @@ func TestPhotoUsecase_PresignUpload_QuotaIncrementFailureIsBestEffort(t *testing
 
 	buf := captureLogs(t)
 	out, err := uc.PresignUpload(context.Background(), "drv-001", "veh-001", "ok.jpg")
-	if err != nil {
-		t.Fatalf("expected best-effort success, got: %v", err)
+	if err == nil {
+		t.Fatal("expected fail-closed error on writeQuota failure")
 	}
-	if out == nil || out.URL == "" {
-		t.Fatal("expected URL on success")
+	if !errors.Is(err, domain.ErrUnavailable) {
+		t.Errorf("err = %v, want errors.Is(domain.ErrUnavailable)", err)
 	}
-	// Warn log should mention the failure for operators.
-	if !strings.Contains(buf.String(), "quota increment failed") {
-		t.Errorf("expected warn log on increment failure, got %q", buf.String())
+	if out != nil {
+		t.Errorf("expected nil output when fail-closed; got %+v", out)
+	}
+	// Warn log still fires so operators see the KV health drift.
+	if !strings.Contains(buf.String(), "quota write failed") && !strings.Contains(buf.String(), "kv put 500") {
+		t.Errorf("expected warn log mentioning the storage failure; got %q", buf.String())
 	}
 }
 

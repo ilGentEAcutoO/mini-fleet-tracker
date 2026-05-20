@@ -277,13 +277,16 @@ func (u *PhotoUsecase) PresignUpload(
 		return nil, fmt.Errorf("photo presign: PresignPutObject: %w", err)
 	}
 
-	// Increment the counter. Best-effort: a Put failure is logged but
-	// does not fail the request, because the URL we just minted is
-	// already valid for 5 minutes and the operator would rather see
-	// the upload land than have the user retry while a transient KV
-	// hiccup heals. The cost of the rare "we under-counted by one"
-	// case is one extra upload past the cap — acceptable for a demo,
-	// and observable in logs.
+	// Increment the counter. TASK-052 / security review M2: this used to
+	// be best-effort (log + return URL) but a KV write outage that way
+	// uncapped the daily-3 quota — the counter stayed stuck while every
+	// retry re-minted a fresh URL. The new contract is fail-CLOSED:
+	// a Put failure returns domain.ErrUnavailable so the handler emits
+	// 503 + Retry-After and the SPA's retry path engages rather than
+	// bursting uncounted uploads through the gap. The presigned URL we
+	// just minted never reaches the client — PresignPutObject is pure
+	// SigV4 cryptography (no R2 capacity reservation), so a discarded
+	// URL is a no-cost waste.
 	if putErr := u.writeQuotaCount(ctx, quotaKey, used+1); putErr != nil {
 		log.Warn().
 			Err(putErr).
@@ -291,7 +294,8 @@ func (u *PhotoUsecase) PresignUpload(
 			Str("user_id", userID).
 			Str("quota_key", quotaKey).
 			Int("used_before", used).
-			Msg("photo presign: quota increment failed; URL issued anyway")
+			Msg("photo presign: quota write failed; refusing upload (fail-closed)")
+		return nil, fmt.Errorf("photo presign: quota write: %w: %w", putErr, domain.ErrUnavailable)
 	}
 
 	// Convert SDK's signed-header map to a flat map[string]string for
