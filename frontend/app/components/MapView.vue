@@ -61,7 +61,14 @@ const styleLoaded = ref(false)
 const PATH_SOURCE_ID = 'fleet-history-path'
 const PATH_LAYER_ID = 'fleet-history-line'
 
-onMounted(() => {
+onMounted(async () => {
+  // <ClientOnly> defers its default slot until ITS own onMounted fires,
+  // which sets `mounted.value = true` and schedules a re-render. Our
+  // parent onMounted runs before that re-render flushes, so `mapEl` is
+  // still null on the first tick. Waiting one nextTick lets the slot
+  // render and the template ref bind to the real <div>. Same pattern as
+  // GeofenceEditor.vue.
+  await nextTick()
   if (!mapEl.value) return
   try {
     map.value = new ns.Map({
