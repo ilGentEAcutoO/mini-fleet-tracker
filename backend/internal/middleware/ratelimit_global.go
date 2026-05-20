@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog/log"
 )
 
 // Global cost-protection rate limits. These are the project-wide umbrella
@@ -111,9 +112,11 @@ func NewGlobal(cfg GlobalConfig) (fiber.Handler, error) {
 
 		// Read current counters. Storage errors fail open (see comment
 		// above); a missing key reads as count=0 which is the correct
-		// initial state for a brand-new window.
-		minuteCount := readCounter(c.UserContext(), cfg.Storage, minuteKey)
-		dayCount := readCounter(c.UserContext(), cfg.Storage, dayKey)
+		// initial state for a brand-new window. The reader logs the
+		// underlying error at WARN with request scope so a quiet KV
+		// outage is observable — TASK-054 / security review M1.
+		minuteCount := readCounter(c, cfg.Storage, minuteKey)
+		dayCount := readCounter(c, cfg.Storage, dayKey)
 
 		// Check BEFORE incrementing so the cap is inclusive: the
 		// (GlobalPerMinuteLimit+1)th request in a minute is the first
@@ -128,9 +131,26 @@ func NewGlobal(cfg GlobalConfig) (fiber.Handler, error) {
 		// Increment both counters. We do not chain the two Write calls
 		// in a transaction — KV does not support that and the worst case
 		// (one counter advances while the other does not) skews counts by
-		// at most one per affected request.
-		_ = writeCounter(c.UserContext(), cfg.Storage, minuteKey, minuteCount+1, globalMinuteTTL)
-		_ = writeCounter(c.UserContext(), cfg.Storage, dayKey, dayCount+1, globalDayTTL)
+		// at most one per affected request. Errors are logged at WARN so
+		// a quiet KV outage stays observable — TASK-054.
+		if err := writeCounter(c.UserContext(), cfg.Storage, minuteKey, minuteCount+1, globalMinuteTTL); err != nil {
+			log.Warn().
+				Err(err).
+				Str("request_id", RequestIDFromCtx(c)).
+				Str("route", c.Path()).
+				Str("ip", c.IP()).
+				Str("counter_key", minuteKey).
+				Msg("global rate-limit storage write failed; allowing request (counter may drift)")
+		}
+		if err := writeCounter(c.UserContext(), cfg.Storage, dayKey, dayCount+1, globalDayTTL); err != nil {
+			log.Warn().
+				Err(err).
+				Str("request_id", RequestIDFromCtx(c)).
+				Str("route", c.Path()).
+				Str("ip", c.IP()).
+				Str("counter_key", dayKey).
+				Msg("global rate-limit storage write failed; allowing request (counter may drift)")
+		}
 
 		return c.Next()
 	}, nil
@@ -140,9 +160,29 @@ func NewGlobal(cfg GlobalConfig) (fiber.Handler, error) {
 // corrupt bodies also read as 0 (the next write will overwrite). Errors
 // fail open by returning 0 — the caller's increment proceeds as if this
 // were a brand-new window.
-func readCounter(ctx context.Context, storage RateLimiterStorage, key string) int64 {
-	raw, _, err := storage.Read(ctx, key)
-	if err != nil || len(raw) == 0 {
+//
+// TASK-054: Read failures are now logged at WARN with the request scope
+// so a 30-second KV outage is observable rather than silently uncapping
+// the cost-protection umbrella. The global limiter still fails open on
+// purpose (denying every request to every route during a KV outage is
+// worse than letting the cap lapse), but operators must SEE the lapse.
+//
+// Signature widened to take *fiber.Ctx (not context.Context) so the
+// WARN log can carry request_id, route, and IP — RequestIDFromCtx
+// needs the Fiber locals.
+func readCounter(c *fiber.Ctx, storage RateLimiterStorage, key string) int64 {
+	raw, _, err := storage.Read(c.UserContext(), key)
+	if err != nil {
+		log.Warn().
+			Err(err).
+			Str("request_id", RequestIDFromCtx(c)).
+			Str("route", c.Path()).
+			Str("ip", c.IP()).
+			Str("counter_key", key).
+			Msg("global rate-limit storage read failed; allowing request (fail-open umbrella)")
+		return 0
+	}
+	if len(raw) == 0 {
 		return 0
 	}
 	// Counters are stored as a base-10 ASCII integer so the KV value

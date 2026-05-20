@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 // ---------------------------------------------------------------------------
@@ -628,5 +631,161 @@ func TestGlobal_DoesNotSwallowHandlerErrors(t *testing.T) {
 	// Fiber translates a handler-returned error into a 500 by default.
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 (handler error)", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TASK-054 — security review M1.
+//
+// Before: enforceBucket and NewGlobal silently swallowed storage errors
+// and called c.Next() — a 30-second KV outage uncapped /api/auth/login.
+//
+// After:
+//   - enforceBucket logs the storage error at WARN with request_id, route,
+//     and IP before falling open.
+//   - NewGlobal logs the storage error at WARN before falling open.
+//   - A new NewPerIPCriticalFailClosed constructor with identical config
+//     surface fails CLOSED on storage error (503 + Retry-After), used in
+//     bootstrap.go ONLY for the /api/auth/login and /api/auth/register
+//     routes. Critical routes must never silently lose their cap.
+// ---------------------------------------------------------------------------
+
+// captureZeroLog redirects zerolog's package-level Logger to a private
+// buffer for the duration of a test and returns a getter for the
+// accumulated output. The pattern matches usecase/position_usecase_test.go's
+// captureLogs but writes a string-builder for cheaper concatenation here.
+func captureZeroLog(t *testing.T) func() string {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := log.Logger
+	log.Logger = zerolog.New(&buf).Level(zerolog.WarnLevel)
+	t.Cleanup(func() { log.Logger = prev })
+	return func() string { return buf.String() }
+}
+
+// TestEnforceBucket_StorageError_LogsWarn pins TASK-054 (M1). The middleware
+// continues to fail open on storage failure but must emit a WARN log so
+// operators see the KV degradation in their dashboards.
+func TestEnforceBucket_StorageError_LogsWarn(t *testing.T) {
+	getLogs := captureZeroLog(t)
+
+	start := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	clk := newClock(start)
+	storage := newMemStorage(clk.now)
+	storage.errAt = func(key string) error { return errors.New("kv read 500") }
+
+	h, err := NewPerIP(PerIPConfig{
+		Storage:   storage,
+		KeyPrefix: "rl-test",
+		Bucket:    Bucket{Capacity: 5, RefillRate: 1.0},
+		TTL:       time.Minute,
+		Now:       clk.now,
+	})
+	if err != nil {
+		t.Fatalf("NewPerIP: %v", err)
+	}
+
+	app := newTestFiberApp()
+	app.Use(RequestID())
+	app.Use(h)
+	app.Get("/", func(c *fiber.Ctx) error { return c.SendString("ok") })
+
+	resp := requestFromIP(t, app, "10.99.0.1")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (fail-open for non-critical routes)", resp.StatusCode)
+	}
+	out := getLogs()
+	if !strings.Contains(out, "rate-limit storage read failed") && !strings.Contains(out, "kv read 500") {
+		t.Errorf("expected WARN log about storage failure; got: %s", out)
+	}
+}
+
+// TestNewPerIPCriticalFailClosed_StorageError_503 is the new constructor
+// guard: when the KV namespace is unreadable we cannot prove an attacker
+// is under the cap, so /auth/login must refuse rather than fall open.
+// 503 + Retry-After signals "transient infra failure" — clients (and the
+// SPA) treat that as retryable, not permanent.
+func TestNewPerIPCriticalFailClosed_StorageError_503(t *testing.T) {
+	getLogs := captureZeroLog(t)
+
+	storage := newMemStorage(time.Now)
+	storage.errAt = func(key string) error { return errors.New("kv get exploded") }
+
+	h, err := NewPerIPCriticalFailClosed(PerIPConfig{
+		Storage:   storage,
+		KeyPrefix: "rl-login",
+		Bucket:    Bucket{Capacity: 5, RefillRate: 1.0},
+		TTL:       time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewPerIPCriticalFailClosed: %v", err)
+	}
+
+	app := newTestFiberApp()
+	app.Use(RequestID())
+	app.Use(h)
+	app.Get("/", func(c *fiber.Ctx) error { return c.SendString("ok") })
+
+	resp := requestFromIP(t, app, "10.99.0.2")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (fail-closed)", resp.StatusCode)
+	}
+	if ra := resp.Header.Get(fiber.HeaderRetryAfter); ra == "" {
+		t.Errorf("Retry-After header missing on 503")
+	}
+	if !strings.Contains(getLogs(), "rate-limit storage read failed") {
+		t.Errorf("expected WARN log; got: %s", getLogs())
+	}
+}
+
+// TestNewPerIPCriticalFailClosed_StorageOK_Allows is the negative partner —
+// when the KV namespace is healthy the critical limiter behaves exactly
+// like the standard NewPerIP and admits requests under cap.
+func TestNewPerIPCriticalFailClosed_StorageOK_Allows(t *testing.T) {
+	storage := newMemStorage(time.Now)
+	h, err := NewPerIPCriticalFailClosed(PerIPConfig{
+		Storage:   storage,
+		KeyPrefix: "rl-login",
+		Bucket:    Bucket{Capacity: 5, RefillRate: 1.0},
+		TTL:       time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewPerIPCriticalFailClosed: %v", err)
+	}
+
+	app := newTestFiberApp()
+	app.Use(RequestID())
+	app.Use(h)
+	app.Get("/", func(c *fiber.Ctx) error { return c.SendString("ok") })
+
+	resp := requestFromIP(t, app, "10.99.0.3")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (storage OK, under cap)", resp.StatusCode)
+	}
+}
+
+// TestGlobal_StorageError_LogsWarn pins the NewGlobal half: the umbrella
+// cost-protection limiter stays fail-open (a KV outage must not deny
+// every request to every route) but must log the failure so operators
+// see the visibility loss.
+func TestGlobal_StorageError_LogsWarn(t *testing.T) {
+	getLogs := captureZeroLog(t)
+
+	start := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	clk := newClock(start)
+	storage := newMemStorage(clk.now)
+	storage.errAt = func(key string) error { return errors.New("kv outage") }
+
+	app := newGlobalApp(t, storage, clk.now)
+	resp := requestFromIP(t, app, "10.99.0.4")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (global fails open)", resp.StatusCode)
+	}
+	if !strings.Contains(getLogs(), "global rate-limit storage read failed") {
+		t.Errorf("expected WARN log; got: %s", getLogs())
 	}
 }

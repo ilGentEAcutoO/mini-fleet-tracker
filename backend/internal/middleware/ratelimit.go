@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog/log"
 )
 
 // Bucket parameters for a token-bucket rate limiter.
@@ -132,6 +133,50 @@ func NewPerIP(cfg PerIPConfig) (fiber.Handler, error) {
 	}, nil
 }
 
+// NewPerIPCriticalFailClosed is identical to NewPerIP except for the
+// behaviour when the storage layer fails to read state. NewPerIP (and
+// NewPerUser) admit the request on a storage error — the right call for
+// non-critical routes because denying every request during a KV outage
+// is worse than letting a few extra hit the global cap.
+//
+// For the login + register endpoints that calculus inverts. A 30s KV
+// outage with the standard fail-open would let an attacker bypass the
+// brute-force ceiling for that full window — long enough to test a few
+// thousand passwords. Critical routes therefore fail CLOSED: a storage
+// read error returns 503 (with Retry-After) so legitimate users see a
+// retryable error and credential-stuffing attempts hit a wall.
+//
+// The constructor signature is identical to NewPerIP so callers in
+// bootstrap.go can swap one for the other based on route sensitivity
+// without re-shaping the wiring code. TASK-054 / security review M1.
+func NewPerIPCriticalFailClosed(cfg PerIPConfig) (fiber.Handler, error) {
+	if cfg.Storage == nil {
+		return nil, errors.New("rate-limit: storage is required")
+	}
+	if strings.TrimSpace(cfg.KeyPrefix) == "" {
+		return nil, errors.New("rate-limit: key prefix is required")
+	}
+	if err := cfg.Bucket.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.TTL <= 0 {
+		cfg.TTL = 5 * time.Minute
+	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
+
+	return func(c *fiber.Ctx) error {
+		ip := strings.TrimSpace(c.IP())
+		if ip == "" {
+			ip = "unknown"
+		}
+		key := cfg.KeyPrefix + ":" + ip
+		return enforceBucketFailClosed(c, cfg.Storage, key, cfg.Bucket, cfg.TTL, now)
+	}, nil
+}
+
 // PerUserConfig is the constructor input for NewPerUser.
 type PerUserConfig struct {
 	Storage   RateLimiterStorage
@@ -199,9 +244,19 @@ func enforceBucket(
 
 	raw, _, err := storage.Read(ctx, key)
 	if err != nil {
-		// On storage error we fail open: better to serve a request than
-		// to 500 every caller because KV is having a bad minute. Operators
-		// will see the error logged by the storage adapter itself.
+		// Fail-OPEN: better to serve a request than to 500 every caller
+		// because KV is having a bad minute. We log at WARN so operators
+		// see the visibility loss in their dashboard before the next
+		// brute-force probe — TASK-054 / security review M1. The KVStorage
+		// adapter itself does NOT log because it doesn't know the
+		// request scope; correlation is the middleware's job.
+		log.Warn().
+			Err(err).
+			Str("request_id", RequestIDFromCtx(c)).
+			Str("route", c.Path()).
+			Str("ip", c.IP()).
+			Str("rate_limit_key", key).
+			Msg("rate-limit storage read failed; allowing request (fail-open)")
 		return c.Next()
 	}
 
@@ -245,9 +300,109 @@ func enforceBucket(
 
 	state.Tokens -= 1.0
 	if err := persistBucket(ctx, storage, key, &state, ttl); err != nil {
-		// Persistence failure is logged by the storage adapter; we still
-		// admit the request because the alternative is to lock out
-		// legitimate traffic over a backend hiccup.
+		// Persistence failure: still admit (legitimate-traffic protection)
+		// but log so operators see the count drift. TASK-054.
+		log.Warn().
+			Err(err).
+			Str("request_id", RequestIDFromCtx(c)).
+			Str("route", c.Path()).
+			Str("ip", c.IP()).
+			Str("rate_limit_key", key).
+			Msg("rate-limit storage write failed; allowing request (counter may drift)")
+		return c.Next()
+	}
+	return c.Next()
+}
+
+// enforceBucketFailClosed is the variant used by NewPerIPCriticalFailClosed.
+// Differs from enforceBucket on exactly two paths:
+//
+//   - storage Read error → 503 (fail-CLOSED) instead of fail-open.
+//   - storage Write error → still admits (state is in-memory at the write
+//     site; the bucket itself rolled forward). Refusing a request whose
+//     downstream check already passed would be incoherent — the cap was
+//     consulted; only the persistence is flaky.
+//
+// 503 (not 429) because the failure is infra-level transient. SPAs treat
+// 503 as retryable, which matches reality; 429 would tell them
+// "you exceeded the limit" which is misleading.
+func enforceBucketFailClosed(
+	c *fiber.Ctx,
+	storage RateLimiterStorage,
+	key string,
+	bucket Bucket,
+	ttl time.Duration,
+	now func() time.Time,
+) error {
+	ctx := c.UserContext()
+	nowT := now()
+	nowMs := nowT.UnixMilli()
+
+	raw, _, err := storage.Read(ctx, key)
+	if err != nil {
+		// Fail-CLOSED — TASK-054 / security review M1. Log the storage
+		// error then return 503 with a generous Retry-After. We use
+		// 503 (not 429) so the SPA's "retryable infra error" pill is
+		// shown rather than the "you hit the limit" pill — the cause
+		// here is KV, not the client's request rate.
+		log.Warn().
+			Err(err).
+			Str("request_id", RequestIDFromCtx(c)).
+			Str("route", c.Path()).
+			Str("ip", c.IP()).
+			Str("rate_limit_key", key).
+			Msg("rate-limit storage read failed; denying request (fail-closed for critical route)")
+		c.Set(fiber.HeaderRetryAfter, "60")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(rateLimitErrorBody{
+			Error:      "service_unavailable",
+			Message:    "rate-limit storage unavailable; please retry",
+			RetryAfter: 60,
+			RequestID:  RequestIDFromCtx(c),
+		})
+	}
+
+	var state bucketState
+	if len(raw) == 0 {
+		state.Tokens = float64(bucket.Capacity)
+		state.LastRefillMs = nowMs
+	} else {
+		if err := json.Unmarshal(raw, &state); err != nil {
+			// Corrupt state — treat as fresh and overwrite.
+			state.Tokens = float64(bucket.Capacity)
+			state.LastRefillMs = nowMs
+		}
+	}
+
+	elapsedMs := nowMs - state.LastRefillMs
+	if elapsedMs > 0 {
+		state.Tokens += (float64(elapsedMs) / 1000.0) * bucket.RefillRate
+		if state.Tokens > float64(bucket.Capacity) {
+			state.Tokens = float64(bucket.Capacity)
+		}
+	}
+	state.LastRefillMs = nowMs
+
+	if state.Tokens < 1.0 {
+		needed := 1.0 - state.Tokens
+		retry := math.Ceil(needed / bucket.RefillRate)
+		if retry < 1 {
+			retry = 1
+		}
+		_ = persistBucket(ctx, storage, key, &state, ttl)
+		return respondTooMany(c, int64(retry), "rate limit exceeded")
+	}
+
+	state.Tokens -= 1.0
+	if err := persistBucket(ctx, storage, key, &state, ttl); err != nil {
+		// Persistence flake: counter drifts by at most one, log + admit.
+		// The Read succeeded so the cap was honoured.
+		log.Warn().
+			Err(err).
+			Str("request_id", RequestIDFromCtx(c)).
+			Str("route", c.Path()).
+			Str("ip", c.IP()).
+			Str("rate_limit_key", key).
+			Msg("rate-limit storage write failed on critical route; allowing request (counter may drift)")
 		return c.Next()
 	}
 	return c.Next()

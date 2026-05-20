@@ -284,7 +284,15 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	// so the bucket is tight (5 attempts per 5 minutes per IP). Healthz
 	// gets its own loose-but-non-zero cap (60/min) so a misbehaving
 	// monitor cannot single-handedly burn the global budget.
-	loginRL, err := middleware.NewPerIP(middleware.PerIPConfig{
+	//
+	// TASK-054 / security review M1: login + register are wired with
+	// NewPerIPCriticalFailClosed instead of NewPerIP. The behaviour is
+	// identical under healthy KV but diverges on storage failure —
+	// critical limiters return 503 (retryable) rather than admitting,
+	// closing the brute-force window that a 30-second KV outage would
+	// otherwise open. Other routes keep fail-open semantics because a
+	// blanket deny during a KV outage is worse than a counter lapse.
+	loginRL, err := middleware.NewPerIPCriticalFailClosed(middleware.PerIPConfig{
 		Storage:   rlStorage,
 		KeyPrefix: "rl-login",
 		Bucket:    middleware.Bucket{Capacity: 5, RefillRate: 5.0 / 300.0}, // 5 tokens per 5 minutes
@@ -294,7 +302,7 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 		return nil, cleanup, fmt.Errorf("setup: login rate-limit: %w", err)
 	}
 
-	registerRL, err := middleware.NewPerIP(middleware.PerIPConfig{
+	registerRL, err := middleware.NewPerIPCriticalFailClosed(middleware.PerIPConfig{
 		Storage:   rlStorage,
 		KeyPrefix: "rl-register",
 		Bucket:    middleware.Bucket{Capacity: 5, RefillRate: 5.0 / 600.0}, // 5 per 10 minutes
