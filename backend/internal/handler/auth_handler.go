@@ -55,11 +55,14 @@ type TokenIntrospector interface {
 // the cookie to fleet-tracker.jairukchan.com; development leaves Secure=
 // false and Domain empty so plain HTTP localhost works without TLS.
 //
-// SameSite is fixed to Lax in both environments — Strict would break the
-// CSRF cookie's intended dual-submit pattern (the cookie needs to ride
-// along on legitimate same-site fetches), and None would weaken
-// cross-origin protection without a corresponding security benefit for
-// our single-origin SPA.
+// SameSite here describes the default for auth_token: Lax in both
+// environments. The CSRF cookie overrides this to Strict at the Login
+// site (see TASK-059 / security review L1) — Lax on the CSRF token is
+// the textbook double-submit weak point because a top-level cross-site
+// navigation still ships the cookie; Strict closes that gap. Auth_token
+// staying Lax is deliberate: the SPA expects deep-link clicks
+// (e.g. an email with /dashboard?vehicle=42) to land on a logged-in
+// session, which would break under Strict.
 type CookieAttrs struct {
 	Secure   bool
 	Domain   string
@@ -302,7 +305,14 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 		Expires:  expires,
 		Secure:   h.cookieAttrs.Secure,
 		HTTPOnly: false,
-		SameSite: h.cookieAttrs.SameSite,
+		// SameSite=Strict on the CSRF cookie — TASK-059 / security review L1.
+		// The double-submit pattern needs Strict so a top-level cross-site
+		// navigation can't ride the cookie + an attacker-supplied header
+		// to forge a same-origin request. Strict is safe here because the
+		// SPA is single-origin (no OAuth callback, no federated login)
+		// so there's no legitimate cross-site initiator for the CSRF
+		// cookie to accompany.
+		SameSite: "Strict",
 	})
 	return c.JSON(userBody{User: toDTO(d)})
 }
@@ -351,7 +361,11 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 		Expires:  pastExpiry,
 		Secure:   h.cookieAttrs.Secure,
 		HTTPOnly: false,
-		SameSite: h.cookieAttrs.SameSite,
+		// Match the live cookie's SameSite=Strict (see Login) so the
+		// browser identifies and evicts the same cookie — Set-Cookie with
+		// a different SameSite would create a "new" cookie record in
+		// some browsers, leaving the original behind until expiry.
+		SameSite: "Strict",
 	})
 	return c.JSON(statusBody{Status: "ok"})
 }

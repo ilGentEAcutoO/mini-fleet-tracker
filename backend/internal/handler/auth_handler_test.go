@@ -457,6 +457,58 @@ func TestLogin_Success_SetsBothCookies(t *testing.T) {
 	}
 }
 
+// TestLogin_CSRFCookie_IsStrictWhileAuthStaysLax pins TASK-059 (security
+// review L1). The CSRF cookie must be SameSite=Strict so a top-level
+// cross-site navigation to the API can't carry the double-submit token
+// along. The auth_token cookie stays SameSite=Lax so legitimate same-site
+// link clicks keep working — the SPA is single-origin so there is no
+// federated login flow that needs Lax on CSRF.
+//
+// Note the deliberate asymmetry: weakening auth_token to Strict has been
+// shown to break the "share a deep link" UX in some browsers, and the
+// security review did NOT flag auth_token — only the CSRF cookie.
+func TestLogin_CSRFCookie_IsStrictWhileAuthStaysLax(t *testing.T) {
+	h := newHarness(t)
+
+	regBody := registerRequest{
+		Email: "ada@example.com", Password: "hunter2-very-secure", Name: "Ada", Role: "driver",
+	}
+	_, _ = h.app.Test(jsonReq(t, http.MethodPost, "/api/auth/register", regBody))
+
+	loginBody := loginRequest{Email: "ada@example.com", Password: "hunter2-very-secure"}
+	resp, err := h.app.Test(jsonReq(t, http.MethodPost, "/api/auth/login", loginBody))
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var (
+		authSameSite, csrfSameSite http.SameSite
+		seenAuth, seenCSRF         bool
+	)
+	for _, ck := range resp.Cookies() {
+		switch ck.Name {
+		case middleware.AuthCookieName:
+			seenAuth = true
+			authSameSite = ck.SameSite
+		case middleware.CSRFCookieName:
+			seenCSRF = true
+			csrfSameSite = ck.SameSite
+		}
+	}
+	if !seenAuth || !seenCSRF {
+		t.Fatalf("expected both cookies; auth=%v csrf=%v", seenAuth, seenCSRF)
+	}
+	if authSameSite != http.SameSiteLaxMode {
+		t.Errorf("auth_token SameSite = %v, want Lax (unchanged)", authSameSite)
+	}
+	if csrfSameSite != http.SameSiteStrictMode {
+		t.Errorf("csrf_token SameSite = %v, want Strict (TASK-059)", csrfSameSite)
+	}
+}
+
 func TestLogin_WrongPassword_401(t *testing.T) {
 	h := newHarness(t)
 	regBody := registerRequest{
