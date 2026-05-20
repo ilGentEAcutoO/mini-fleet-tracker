@@ -229,6 +229,61 @@ function appendVary(headers: Headers, value: string): void {
 // almost nothing (one SubtleCrypto.sign) and means a misconfigured route
 // can't accidentally expose the unguarded DO. The gateway uses
 // constant-time comparison via timingSafeEqualHex.
+//
+// TASK-051 — replay protection:
+// The new signature contract is
+//   sig = HMAC-SHA256(body || "\n" || ts, secret)
+// where `ts` is the unix-seconds value of the X-Timestamp header. The
+// verifier accepts the new mode if |now - ts| <= 30s and the signature
+// matches. If that check fails (or X-Timestamp is absent), we fall back
+// to the legacy `HMAC-SHA256(body, secret)`. The fallback is a 24h
+// transition allowance so publisher (backend Go) and verifier (workers)
+// can deploy in any order without breaking broadcasts. A separate task
+// removes the fallback after 24h of clean operation.
+//
+// Replay window: 30s. Allowed clock skew is the same on both sides.
+const REPLAY_WINDOW_SECONDS = 30
+
+type HmacMode = 'new' | 'legacy'
+
+async function verifyPublishHMAC(
+  body: Uint8Array,
+  signature: string,
+  timestamp: string | null,
+  secret: string,
+): Promise<{ ok: boolean; mode: HmacMode }> {
+  // New mode: signature over (body || "\n" || ts), window check on ts.
+  if (timestamp !== null) {
+    const tsNum = Number.parseInt(timestamp, 10)
+    if (Number.isFinite(tsNum)) {
+      const nowSec = Math.floor(Date.now() / 1000)
+      const skew = Math.abs(nowSec - tsNum)
+      if (skew <= REPLAY_WINDOW_SECONDS) {
+        // Concatenate body || "\n" || ts as bytes so the join is
+        // byte-deterministic across runtimes (Go's []byte append + the
+        // backend publisher use the exact same encoding).
+        const tsBytes = new TextEncoder().encode('\n' + timestamp)
+        const joined = new Uint8Array(body.length + tsBytes.length)
+        joined.set(body, 0)
+        joined.set(tsBytes, body.length)
+        const expectedNew = await hmacSha256Hex(secret, joined)
+        if (timingSafeEqualHex(signature, expectedNew)) {
+          return { ok: true, mode: 'new' }
+        }
+      }
+    }
+  }
+
+  // Legacy fallback — body-only HMAC. Accepted for 24h after rollout so
+  // publisher + verifier can be deployed in any order. Logged when hit
+  // so the operator can monitor when it's safe to remove the fallback.
+  const expectedLegacy = await hmacSha256Hex(secret, body)
+  if (timingSafeEqualHex(signature, expectedLegacy)) {
+    return { ok: true, mode: 'legacy' }
+  }
+  return { ok: false, mode: 'new' }
+}
+
 async function handleInternalPublish(req: Request, env: Env): Promise<Response> {
   if (req.method !== 'POST') {
     return new Response('method not allowed', { status: 405 })
@@ -237,29 +292,52 @@ async function handleInternalPublish(req: Request, env: Env): Promise<Response> 
   if (!sig) {
     return new Response('missing signature', { status: 401 })
   }
+  const ts = req.headers.get('X-Timestamp')
 
   // Buffer the body so we can both verify and forward without re-reading
   // a consumed stream.
   const bodyBytes = new Uint8Array(await req.arrayBuffer())
-  const expected = await hmacSha256Hex(env.INTERNAL_PUBLISH_SECRET, bodyBytes)
-  if (!timingSafeEqualHex(sig, expected)) {
+  const verdict = await verifyPublishHMAC(
+    bodyBytes,
+    sig,
+    ts,
+    env.INTERNAL_PUBLISH_SECRET,
+  )
+  if (!verdict.ok) {
     return new Response('bad signature', { status: 401 })
+  }
+  if (verdict.mode === 'legacy') {
+    // Operator-visible signal that the 24h fallback path is still in
+    // active use — once this stops appearing in logs we can remove the
+    // legacy branch in a follow-up task.
+    console.log('hmac_mode=legacy path=/internal/publish')
   }
 
   // Forward to the DO. We rewrite the URL to /publish so the DO router
-  // doesn't have to know about the /internal/ prefix.
+  // doesn't have to know about the /internal/ prefix. Forward
+  // X-Timestamp when present so the DO's verifier can apply the same
+  // new-mode + legacy-fallback contract — Charlie-2's DO mirrors this
+  // logic byte-for-byte.
   const id = env.FLEET_HUB.idFromName('global-fleet')
   const stub = env.FLEET_HUB.get(id)
+  const forwardHeaders = new Headers({
+    'Content-Type': req.headers.get('Content-Type') ?? 'application/json',
+    'X-Signature': sig,
+  })
+  if (ts !== null) {
+    forwardHeaders.set('X-Timestamp', ts)
+  }
   const internalReq = new Request('https://fleet-hub.internal/publish', {
     method: 'POST',
-    headers: {
-      'Content-Type': req.headers.get('Content-Type') ?? 'application/json',
-      'X-Signature': sig,
-    },
+    headers: forwardHeaders,
     body: bodyBytes,
   })
   return stub.fetch(internalReq)
 }
+
+// Exported for tests that drive the verifier directly without going
+// through the full request pipeline.
+export { verifyPublishHMAC }
 
 // --- /ws/* ---
 
