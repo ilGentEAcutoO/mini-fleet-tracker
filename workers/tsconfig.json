@@ -23,6 +23,9 @@
     "fleet-hub/test/**/*",
     "gateway/src/**/*",
     "gateway/test/**/*",
+    "api/src/**/*",
+    "api/test/**/*",
+    "api/vitest.config.ts",
     "vitest.config.ts",
     "worker-configuration.d.ts"
   ]

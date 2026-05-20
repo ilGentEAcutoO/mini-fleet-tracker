@@ -12,6 +12,7 @@
 // here either as a [vars] entry (non-sensitive) or as a wrangler secret
 // (sensitive — never in this file or wrangler.toml).
 import { Container } from '@cloudflare/containers'
+import { safeContainerErrorMessage } from './error-log'
 
 interface Env {
   FLEET_API: DurableObjectNamespace
@@ -74,7 +75,14 @@ export class FleetAPI extends Container<Env> {
   }
 
   override onError(err: unknown) {
-    console.error('FleetAPI container error', err)
+    // TASK-058 (security-review.md Workers M2): log only the message,
+    // never the full error object. See safeContainerErrorMessage for
+    // rationale (avoids leaking err.cause / err.stack into Workers
+    // logs if application code wraps user-controlled input).
+    console.error(
+      'FleetAPI container error:',
+      safeContainerErrorMessage(err),
+    )
   }
 }
 
