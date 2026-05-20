@@ -47,15 +47,48 @@ async function loginAsDemo(role: 'manager' | 'driver') {
   formError.value = null
   demoSubmitting.value = role
   const creds = DEMO_CREDS[role]
+  const apiBase = useRuntimeConfig().public.apiBase
+  // Two-step raw-fetch login + manual Pinia populate, then SPA nav. Why this
+  // shape instead of `auth.login()` + `router.push()`:
+  //
+  //   1. POST /auth/login responses from the CF Container intermittently arrive
+  //      with `content-encoding: zstd` and no terminating Content-Length on the
+  //      success path. `r.json()` then hangs on the body stream, so the Pinia
+  //      store never sees `user.value = u`. The Set-Cookie headers have already
+  //      landed by the time fetch resolves, so we skip reading the login body
+  //      entirely.
+  //   2. /auth/me's body stream is reliable, so we read the user record from
+  //      there and assign it onto the auth store directly. The middleware
+  //      reads `fetched` + `user` short-circuits the next push.
+  //   3. SPA `router.push` keeps the demo button feeling instant (no full
+  //      reload). A `window.location.assign` would bounce off the documented
+  //      SSR cookie-validation gap (todos.md / TASK-029 line 160).
   try {
-    await auth.login({ email: creds.email, password: creds.password })
+    const loginResp = await fetch(`${apiBase}/auth/login`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: creds.email, password: creds.password }),
+    })
+    if (!loginResp.ok) {
+      formError.value = 'Demo sign-in failed. Please try again.'
+      demoSubmitting.value = null
+      return
+    }
+    const meResp = await fetch(`${apiBase}/auth/me`, { credentials: 'include' })
+    if (!meResp.ok) {
+      formError.value = 'Demo session check failed. Please try again.'
+      demoSubmitting.value = null
+      return
+    }
+    const meBody = (await meResp.json()) as { user: typeof auth.user }
+    auth.user = meBody.user
+    auth.fetched = true
     await router.push(creds.landing)
   }
   catch (err: unknown) {
-    const e = err as { data?: { message?: string } } | undefined
-    formError.value = e?.data?.message ?? 'Demo sign-in failed. Please try again.'
-  }
-  finally {
+    const e = err as { message?: string } | undefined
+    formError.value = e?.message ?? 'Demo sign-in failed. Please try again.'
     demoSubmitting.value = null
   }
 }
