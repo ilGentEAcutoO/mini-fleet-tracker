@@ -26,6 +26,11 @@ interface Props {
   // can call `.set(id, pos)` to upsert without a deep clone, and so we
   // iterate entries in insertion order to keep z-order stable.
   positions: Map<string, Position>
+  // Optional vehicle_id → display label. When provided, each marker gets
+  // a persistent popup with the matching label (typically plate_number).
+  // Missing entries fall back to a truncated vehicle id so callers can
+  // omit labels for unknown vehicles without crashing.
+  labels?: Map<string, string>
   // Optional ordered path. When non-empty, MapView draws a polyline
   // through these points (in order). Pass `undefined` (or omit) to skip
   // the polyline entirely — the live dashboard does not use this.
@@ -36,6 +41,7 @@ interface Props {
 }
 
 const props = withDefaults(defineProps<Props>(), {
+  labels: () => new Map<string, string>(),
   path: () => [],
   // Bangkok — the demo dataset is Bangkok-flavoured and the dashboard's
   // initial empty state should look intentional, not "lost at 0,0 in
@@ -106,6 +112,10 @@ watch(
   { deep: false },
 )
 
+function labelFor(vehicleId: string): string {
+  return props.labels.get(vehicleId) ?? vehicleId.slice(0, 8)
+}
+
 function syncMarkers() {
   const m = map.value
   if (!m || !styleLoaded.value) return
@@ -118,13 +128,26 @@ function syncMarkers() {
       const marker = new ns.Marker({ color: '#2563eb' })
         .setLngLat([pos.lng, pos.lat])
         .addTo(m)
-      // Optional tooltip via popup; left as no-op here so the live
-      // dashboard stays uncluttered. Hovering shows the marker only.
+      // Persistent popup with the plate / label. `closeButton: false` +
+      // `closeOnClick: false` means the popup stays anchored to the
+      // marker as the user pans; `togglePopup()` after attaching opens
+      // it once and leaves it open.
+      const popup = new ns.Popup({
+        closeButton: false,
+        closeOnClick: false,
+        offset: 28,
+        className: 'fleet-marker-popup',
+      }).setText(labelFor(vehicleId))
+      marker.setPopup(popup)
+      marker.togglePopup()
       marker.getElement().title = vehicleId
       markers.set(vehicleId, marker)
-    } else {
+    }
+    else {
       // Upsert: nudge the existing marker without rebuilding the DOM.
       existing.setLngLat([pos.lng, pos.lat])
+      const popup = existing.getPopup()
+      if (popup) popup.setText(labelFor(vehicleId))
     }
   }
 
@@ -136,6 +159,18 @@ function syncMarkers() {
     }
   }
 }
+
+// React to label changes (eg vehicle plate edits) without recreating markers.
+watch(
+  () => Array.from(props.labels.entries()),
+  () => {
+    for (const [vehicleId, marker] of markers.entries()) {
+      const popup = marker.getPopup()
+      if (popup) popup.setText(labelFor(vehicleId))
+    }
+  },
+  { deep: false },
+)
 
 // syncPath reconciles the polyline source data with `props.path`. We
 // add the source + layer once (lazy on first non-empty path); on
@@ -218,3 +253,24 @@ onBeforeUnmount(() => {
     <div v-else ref="mapEl" :class="className" />
   </ClientOnly>
 </template>
+
+<style>
+/* Non-scoped because MapLibre injects the popup DOM outside the SFC tree. */
+.fleet-marker-popup .maplibregl-popup-content {
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  background: rgb(37 99 235); /* matches the #2563eb marker dot */
+  color: white;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.fleet-marker-popup .maplibregl-popup-tip {
+  border-top-color: rgb(37 99 235);
+  border-bottom-color: rgb(37 99 235);
+}
+.fleet-marker-popup .maplibregl-popup-close-button {
+  display: none;
+}
+</style>

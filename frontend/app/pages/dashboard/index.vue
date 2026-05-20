@@ -94,6 +94,24 @@ const center = computed(() => {
   const latest = Array.from(fleet.positions.values()).at(-1)
   return latest ? { lat: latest.lat, lng: latest.lng } : { lat: 13.7563, lng: 100.5018 }
 })
+
+// vehicle_id → plate_number for marker popups. Recomputed when the vehicle
+// roster changes; MapView watches this map and updates open popups without
+// rebuilding markers.
+const vehicleLabels = computed(() => {
+  const out = new Map<string, string>()
+  for (const v of vehicles.value) out.set(v.id, v.plate_number)
+  return out
+})
+
+function formatTimestamp(ms: number): string {
+  const d = new Date(ms)
+  return d.toLocaleTimeString(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
 </script>
 
 <template>
@@ -107,6 +125,7 @@ const center = computed(() => {
       </div>
       <MapView
         :positions="fleet.positions"
+        :labels="vehicleLabels"
         :center="center"
         class-name="h-[560px] w-full rounded-md border border-border"
       />
@@ -140,23 +159,38 @@ const center = computed(() => {
           >
             No vehicles yet.
           </p>
-          <ul v-else class="space-y-2">
+          <ul v-else class="space-y-3">
             <li
               v-for="v in vehicles"
               :key="v.id"
-              class="flex items-center justify-between text-sm"
+              class="text-sm border-b border-border/60 pb-2 last:border-b-0 last:pb-0"
             >
-              <span class="truncate">
-                {{ v.plate_number }}
+              <div class="flex items-center justify-between">
+                <span class="truncate font-medium">
+                  {{ v.plate_number }}
+                  <span
+                    v-if="v.model"
+                    class="text-muted-foreground font-normal"
+                  > · {{ v.model }}</span>
+                </span>
                 <span
-                  v-if="v.model"
-                  class="text-muted-foreground"
-                > · {{ v.model }}</span>
-              </span>
-              <span
-                v-if="fleet.positions.has(v.id)"
-                class="text-xs text-emerald-600"
-              >live</span>
+                  v-if="fleet.positions.has(v.id)"
+                  class="text-xs text-emerald-600 shrink-0 ml-2"
+                >live</span>
+              </div>
+              <div
+                v-if="fleet.positions.get(v.id) as Position | undefined"
+                class="text-xs text-muted-foreground tabular-nums mt-0.5"
+              >
+                <span>{{ fleet.positions.get(v.id)!.lat.toFixed(4) }}, {{ fleet.positions.get(v.id)!.lng.toFixed(4) }}</span>
+                <span class="ml-2 opacity-70">@ {{ formatTimestamp(fleet.positions.get(v.id)!.recorded_at) }}</span>
+              </div>
+              <div
+                v-else
+                class="text-xs text-muted-foreground/70 mt-0.5 italic"
+              >
+                no position reported
+              </div>
             </li>
           </ul>
           <Button
