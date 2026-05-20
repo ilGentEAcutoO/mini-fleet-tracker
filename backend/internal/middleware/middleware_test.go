@@ -203,6 +203,60 @@ func TestCORS_RejectsWildcard(t *testing.T) {
 	}
 }
 
+// TestCORS_RejectsInvalidOrigins exercises the startup-time URL parse guard
+// added by TASK-055 (security review M3). Any origin that does not have BOTH
+// a scheme and a host should be rejected with ErrInvalidAllowOrigin so a
+// misconfigured CORS_ORIGIN surfaces at boot rather than at the first
+// cross-origin fetch (Fiber's CORS treats unknown patterns as deny-all,
+// which would silently break the SPA).
+func TestCORS_RejectsInvalidOrigins(t *testing.T) {
+	cases := []struct {
+		name   string
+		origin string
+	}{
+		{"scheme_only", "http://"},
+		{"no_scheme_just_host", "example.com"},
+		{"wildcard_host_no_scheme", "*.example.com"},
+		{"path_only", "/api"},
+		{"junk", "not a url"},
+		{"control_chars", "http://\x00\x01"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, err := CORS(tc.origin)
+			if err == nil {
+				t.Fatalf("CORS(%q) returned nil error; expected ErrInvalidAllowOrigin (handler non-nil: %v)", tc.origin, h != nil)
+			}
+			if !errors.Is(err, ErrInvalidAllowOrigin) {
+				t.Fatalf("CORS(%q) err = %v, want errors.Is(ErrInvalidAllowOrigin)", tc.origin, err)
+			}
+		})
+	}
+}
+
+// TestCORS_AcceptsValidOrigins is the positive partner. Both http://localhost
+// and https://fleet-tracker.jairukchan.com — the project's two real origins
+// — must continue to construct cleanly.
+func TestCORS_AcceptsValidOrigins(t *testing.T) {
+	cases := []string{
+		"http://localhost:3000",
+		"http://localhost",
+		"https://fleet-tracker.jairukchan.com",
+		"https://example.com:8443",
+	}
+	for _, origin := range cases {
+		t.Run(origin, func(t *testing.T) {
+			h, err := CORS(origin)
+			if err != nil {
+				t.Fatalf("CORS(%q) err = %v, want nil", origin, err)
+			}
+			if h == nil {
+				t.Fatalf("CORS(%q) handler nil; expected non-nil", origin)
+			}
+		})
+	}
+}
+
 func TestCORS_PreflightHeaders(t *testing.T) {
 	h, err := CORS("http://localhost:3000")
 	if err != nil {
