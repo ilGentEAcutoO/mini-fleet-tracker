@@ -36,6 +36,23 @@ zone_name = "jairukchan.com"
 binding = "FLEET_API"
 service = "fleet-api"
 
+# TASK-050 — Workers Rate Limiting binding for /ws/* upgrade defence.
+# 3 attempts per IP per 60s. Returning 429 + Retry-After: 60 from the
+# gateway means an attacker hammering /ws/* with malformed cookies stops
+# burning HMAC import + JWT verify on the DO. The GA `[[ratelimits]]`
+# syntax replaces the older `[[unsafe.bindings]]` form (GA since 2025-09).
+# namespace_id is a positive integer unique within this account — 1001
+# is chosen first-come (no existing ratelimits in this project's tree).
+# Per CF docs IP keys are noisier than per-user keys (carrier NAT, etc.)
+# but that's the documented spec for this defence: keep the gate cheap
+# and burn the noise budget on attackers, not on per-user logic.
+[[ratelimits]]
+name = "WS_RL"
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 3
+  period = 60
+
 [vars]
 # Kept as a dev fallback only. Production traffic always goes through
 # env.FLEET_API service binding above; this var is read only when the

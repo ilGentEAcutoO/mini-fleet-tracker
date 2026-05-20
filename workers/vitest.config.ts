@@ -67,6 +67,15 @@ export default defineConfig({
       // avoids needing a pre-compiled auxiliary worker (Miniflare's
       // `workers` array only accepts JS, not TS — vitest's Vite
       // transform only runs on `main`).
+      //
+      // The gateway's wrangler.toml also declares a `[[services]]`
+      // binding to the separately-deployed `fleet-api` worker. In tests
+      // that worker is absent, so without an override miniflare refuses
+      // to boot the gateway pool worker. We provide a function-form
+      // serviceBindings stub that always returns 502 — every /api/*
+      // test installs a global fetch spy and never reaches this stub,
+      // which exists purely so miniflare can resolve the binding at
+      // start-up.
       {
         plugins: [
           cloudflareTest({
@@ -85,6 +94,26 @@ export default defineConfig({
               durableObjects: {
                 FLEET_HUB: { className: 'FleetHub' },
               },
+              // Stub the cross-worker `[[services]]` binding so the
+              // gateway pool worker can start without the separately
+              // deployed fleet-api worker present. Returns a fixed
+              // sentinel response — tests that exercise /api/* used to
+              // spy on `globalThis.fetch` (the pre-service-binding
+              // HTTP-fallback codepath) and are blocked by the same
+              // architectural shift (commit a701008); their fix is a
+              // separate concern. New tests for TASK-050 / TASK-051 /
+              // TASK-056 do not depend on this stub.
+              serviceBindings: {
+                FLEET_API: async () =>
+                  new Response('fleet-api stub unreachable in tests', {
+                    status: 502,
+                  }),
+              },
+              // TASK-050: the rate-limit test sets CF-Connecting-IP per
+              // request to isolate the limiter key. Miniflare defaults
+              // to stripping inbound CF-Connecting-IP for safety;
+              // disabling that here so the test can drive distinct keys.
+              stripCfConnectingIp: false,
             },
           }),
         ],

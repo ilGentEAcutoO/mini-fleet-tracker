@@ -58,6 +58,11 @@ export interface Env {
   // dev path still type-checks when the binding is absent (wrangler dev
   // without --services); production always has it.
   FLEET_API?: Fetcher
+  // TASK-050: Workers Rate Limiting binding for /ws/* upgrade defence.
+  // Optional so an older deploy (or a wrangler dev without the binding)
+  // still type-checks; the gateway fails open (with a log) in that case
+  // because the global gateway rate cap is the next line of defence.
+  WS_RL?: RateLimit
 }
 
 // Hop-by-hop headers (RFC 7230 §6.1) must not be forwarded — many of them
@@ -114,6 +119,31 @@ export default {
     }
 
     if (path.startsWith('/ws/')) {
+      // TASK-050: rate-limit only the actual upgrade attempts (the GET
+      // that ships an `Upgrade: websocket` header). Plain GETs to /ws/*
+      // are handled by upgradeToHub returning 426 below; counting them
+      // toward the quota would burn it for probes that never reach the
+      // DO. Key by CF-Connecting-IP — the Cloudflare-set trusted-edge
+      // header. Per CF docs IP keys are coarse, but this is the
+      // documented spec for the WS-upgrade defence: keep the gate
+      // cheap, burn noise on attackers not on per-user logic.
+      if (req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+        if (env.WS_RL) {
+          const ip = req.headers.get('CF-Connecting-IP') ?? 'unknown'
+          const { success } = await env.WS_RL.limit({ key: ip })
+          if (!success) {
+            return new Response('Too Many Requests', {
+              status: 429,
+              headers: { 'Retry-After': '60' },
+            })
+          }
+        } else {
+          // Older deploy without the binding — fail open and log so the
+          // operator notices. The global gateway rate cap (if any) and
+          // the DO's JWT + Origin check still apply.
+          console.warn('ws_rl_binding_missing fallback=open')
+        }
+      }
       return upgradeToHub(req, env)
     }
 

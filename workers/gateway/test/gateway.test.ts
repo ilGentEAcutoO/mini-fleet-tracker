@@ -535,3 +535,95 @@ describe('CSP injection', () => {
     }
   })
 })
+
+// ============================================================================
+// TASK-050 — /ws/* upgrade rate limit (Workers Rate-Limiting binding WS_RL)
+// ============================================================================
+//
+// The gateway binds a [[ratelimits]] namespace named WS_RL with
+// limit=3, period=60. Before delegating to the DO, /ws/* requests with
+// an Upgrade: websocket header are gated by env.WS_RL.limit({ key: IP }).
+// The 4th attempt within the window returns 429 + Retry-After: 60.
+//
+// We use a unique IP per test so the limiter's per-key counter doesn't
+// leak between tests. The signed JWT lets the DO 101 the first three
+// upgrades; the 4th is rejected by the gateway BEFORE the DO sees it.
+
+describe('TASK-050: /ws upgrade rate limit', () => {
+  async function attemptUpgrade(ip: string, token: string): Promise<Response> {
+    return SELF.fetch('https://gateway.example/ws/fleet', {
+      method: 'GET',
+      headers: {
+        Upgrade: 'websocket',
+        Origin: ALLOWED_ORIGIN,
+        Cookie: `auth_token=${token}`,
+        'CF-Connecting-IP': ip,
+      },
+    })
+  }
+
+  it('returns 429 + Retry-After: 60 on the 4th upgrade within the window', async () => {
+    const ip = '203.0.113.50'
+    const token = await signValidJwt()
+
+    // First three calls consume the quota. We expect the gateway to
+    // delegate to the DO (which 101s with a valid JWT) — but the test
+    // only cares that they are NOT 429, since the rate limit applies
+    // BEFORE the DO call. Drain the WebSocket to free the test from
+    // hangs on hibernation cleanup.
+    for (let i = 0; i < 3; i++) {
+      const res = await attemptUpgrade(ip, token)
+      expect(res.status).not.toBe(429)
+      if (res.webSocket) {
+        res.webSocket.accept()
+        res.webSocket.close(1000, 'test done')
+      }
+    }
+
+    // 4th attempt is rate-limited at the gateway, BEFORE the DO. The
+    // response must include Retry-After: 60 per the spec.
+    const fourth = await attemptUpgrade(ip, token)
+    expect(fourth.status).toBe(429)
+    expect(fourth.headers.get('Retry-After')).toBe('60')
+  })
+
+  it('counts rate-limit per IP — a different IP is not penalised by another IP exhausting its quota', async () => {
+    const exhaustedIp = '203.0.113.51'
+    const freshIp = '203.0.113.52'
+    const token = await signValidJwt()
+
+    // Exhaust the limit for exhaustedIp.
+    for (let i = 0; i < 3; i++) {
+      const res = await attemptUpgrade(exhaustedIp, token)
+      if (res.webSocket) {
+        res.webSocket.accept()
+        res.webSocket.close(1000, 'exhaust done')
+      }
+    }
+    const exhausted = await attemptUpgrade(exhaustedIp, token)
+    expect(exhausted.status).toBe(429)
+
+    // freshIp should still be able to upgrade — the limiter key is
+    // CF-Connecting-IP per the implementation.
+    const fresh = await attemptUpgrade(freshIp, token)
+    expect(fresh.status).not.toBe(429)
+    if (fresh.webSocket) {
+      fresh.webSocket.accept()
+      fresh.webSocket.close(1000, 'fresh done')
+    }
+  })
+
+  it('does not consume the rate limit on non-websocket /ws requests (426 path)', async () => {
+    // A plain GET to /ws/* returns 426. That branch must not call
+    // env.WS_RL.limit — otherwise a non-WS probe burns the quota.
+    const ip = '203.0.113.53'
+    for (let i = 0; i < 5; i++) {
+      const res = await SELF.fetch('https://gateway.example/ws/fleet', {
+        method: 'GET',
+        headers: { Origin: ALLOWED_ORIGIN, 'CF-Connecting-IP': ip },
+      })
+      // No Upgrade header → 426, NOT 429.
+      expect(res.status).toBe(426)
+    }
+  })
+})
