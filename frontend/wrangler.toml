@@ -8,28 +8,33 @@
 # the bare `wrangler deploy` from this directory after `pnpm build`.
 #
 # Single-origin deployment: production puts this Worker at
-# fleet-tracker.jairukchan.com/* (catch-all, lowest specificity); the
-# gateway Worker's /api/* and /ws/* routes win by specificity. Same-
-# origin means SameSite=Lax cookies work without CORS gymnastics.
+# fleet-tracker.jairukchan.com (Custom Domain — Worker IS the origin); the
+# gateway Worker's /api/* and /ws/* Workers Routes take precedence on the
+# same hostname per Cloudflare docs ("Routes can fetch() Custom Domains
+# and take precedence if configured on the same hostname"). Same-origin
+# means SameSite=Lax cookies work without CORS gymnastics.
 name = "fleet-frontend"
 main = ".output/server/index.mjs"
 compatibility_date = "2026-05-19"
 compatibility_flags = ["nodejs_compat"]
 
+# Custom Domain binding — Wrangler creates the proxied DNS record + Advanced
+# Certificate automatically on deploy via the Workers Custom Domains API
+# (covered by the OAuth session's workers_routes + ssl_certs scopes; no
+# separate Zone DNS:Edit token needed). Table-array `[[routes]]` syntax is
+# used to keep this entry unambiguously at the top level (inline-array
+# `routes = [...]` placed after a section header gets re-parented under
+# that section by the TOML parser).
+[[routes]]
+pattern = "fleet-tracker.jairukchan.com"
+custom_domain = true
+
 [assets]
 directory = ".output/public"
 binding = "ASSETS"
 
-# Frontend catches everything under the apex subdomain that isn't /api/* or
-# /ws/* (which the gateway claims by higher specificity). zone_name lets
-# Wrangler auto-provision the proxied DNS record on first deploy.
-routes = [
-  { pattern = "fleet-tracker.jairukchan.com/*", zone_name = "jairukchan.com" },
-]
-
 [vars]
-# Same-origin URLs (production) — set after DNS lands on the
-# jairukchan.com zone. Until then, dev points at workers.dev URLs.
+# Same-origin URLs (production) — active once the Custom Domain deploys.
 NUXT_PUBLIC_API_BASE = "https://fleet-tracker.jairukchan.com/api"
 NUXT_PUBLIC_WS_BASE = "wss://fleet-tracker.jairukchan.com/ws"
 NUXT_PUBLIC_MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty"
