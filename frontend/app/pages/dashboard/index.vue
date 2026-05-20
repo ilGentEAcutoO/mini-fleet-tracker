@@ -50,39 +50,88 @@ async function fetchVehicles(): Promise<void> {
   }
 }
 
-// Pull the most-recent persisted position per vehicle so the map renders
-// markers on first paint even when no live WS frames have arrived in the
-// current session. Without this seed the map looks empty until a driver
-// reports — bad first impression for the demo audience.
-async function seedLatestPositions(): Promise<void> {
+// Client-side playback of pre-recorded routes.
+//
+// The CF Container backend doesn't run a continuous position simulator (cost-
+// protection — the demo expires 2026-05-31 with a budget under $5). Instead we
+// pre-seed ~60 positions per vehicle covering the last hour and play them back
+// in the browser: each tick interpolates between the two timestamps bracketing
+// `now() % span` and pushes the result into the fleet store. Result is smooth
+// movement on the map without any ongoing backend cost.
+//
+// The WS connection stays open so any real driver POST (e.g. from cmd/sim or
+// /driver/report) overrides the playback for that vehicle.
+const playbackTracks = ref(new Map<string, Position[]>())
+let playbackHandle: ReturnType<typeof setInterval> | null = null
+
+async function loadPlaybackTracks(): Promise<void> {
   if (!auth.isManager) return
-  const since = Date.now() - 24 * 60 * 60 * 1000
+  const since = Date.now() - 60 * 60 * 1000
   await Promise.all(vehicles.value.map(async (v) => {
     try {
       const res = await api<{ positions: Position[] }>(
-        `/vehicles/${v.id}/positions?from=${since}&limit=1`,
+        `/vehicles/${v.id}/positions?from=${since}&limit=500`,
       )
-      const latest = res.positions[0]
-      // Skip if a WS frame has already populated this vehicle while we were
-      // fetching — the WS feed is the live truth.
-      if (latest && !fleet.positions.has(latest.vehicle_id)) {
-        fleet.positions.set(latest.vehicle_id, latest)
-      }
+      // Backend returns DESC (newest first); reverse for chronological playback.
+      const sorted = [...res.positions].reverse()
+      if (sorted.length > 0) playbackTracks.value.set(v.id, sorted)
     }
     catch {
-      // Per-vehicle failures are non-fatal — the map can still show whatever
-      // other vehicles loaded successfully.
+      // Per-vehicle fetch failures are non-fatal — other vehicles still animate.
     }
   }))
+}
+
+function tickPlayback(): void {
+  const now = Date.now()
+  for (const [vehicleId, track] of playbackTracks.value.entries()) {
+    if (track.length === 0) continue
+    const first = track[0]!.recorded_at
+    const last = track[track.length - 1]!.recorded_at
+    const span = last - first
+    if (span <= 0) {
+      fleet.positions.set(vehicleId, track[0]!)
+      continue
+    }
+    // Map current wall time into the track via modulo: track loops every `span`.
+    const elapsed = ((now - first) % span + span) % span
+    const target = first + elapsed
+    // Binary-ish linear scan for the bracketing pair. Cheap for ~60 points.
+    let i = 0
+    while (i < track.length - 1 && track[i + 1]!.recorded_at <= target) i++
+    const a = track[i]!
+    const b = track[Math.min(i + 1, track.length - 1)]!
+    if (b.recorded_at <= a.recorded_at) {
+      fleet.positions.set(vehicleId, a)
+      continue
+    }
+    const t = (target - a.recorded_at) / (b.recorded_at - a.recorded_at)
+    fleet.positions.set(vehicleId, {
+      id: 0,
+      vehicle_id: vehicleId,
+      lat: a.lat + (b.lat - a.lat) * t,
+      lng: a.lng + (b.lng - a.lng) * t,
+      speed_kmh: a.speed_kmh,
+      recorded_at: now,
+      created_at: now,
+    })
+  }
 }
 
 onMounted(async () => {
   fleet.connect()
   await fetchVehicles()
-  void seedLatestPositions()
+  await loadPlaybackTracks()
+  tickPlayback()
+  // 3s cadence — slow enough to be cheap, fast enough to feel alive.
+  playbackHandle = setInterval(tickPlayback, 3000)
 })
 
 onBeforeUnmount(() => {
+  if (playbackHandle) {
+    clearInterval(playbackHandle)
+    playbackHandle = null
+  }
   fleet.disconnect()
 })
 
