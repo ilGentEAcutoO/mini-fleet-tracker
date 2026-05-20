@@ -227,7 +227,7 @@ onMounted(fetchPhotos)
           :key="p.key"
           :href="p.url"
           target="_blank"
-          rel="noopener"
+          rel="noopener noreferrer"
           class="block"
         >
           <img

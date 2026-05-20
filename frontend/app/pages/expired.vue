@@ -21,6 +21,7 @@ useHead({ title: 'Demo expired' })
     <p>
       <a
         href="https://github.com/ilGentEAcutoO/mini-fleet-tracker"
+        rel="noopener noreferrer"
         class="underline"
       >
         github.com/ilGentEAcutoO/mini-fleet-tracker

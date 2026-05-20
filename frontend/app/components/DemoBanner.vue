@@ -39,6 +39,7 @@ const expired = computed(() => msLeft.value < 0)
       Live demo has ended.
       <a
         href="https://github.com/ilGentEAcutoO/mini-fleet-tracker"
+        rel="noopener noreferrer"
         class="underline font-medium"
       >View source on GitHub</a>.
     </template>
