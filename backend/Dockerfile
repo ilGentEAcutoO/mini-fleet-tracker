@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- build stage ----------
-FROM golang:1.23-alpine AS build
+FROM golang:1.25-alpine AS build
 
 ARG GIT_COMMIT=dev
 ENV CGO_ENABLED=0 \
