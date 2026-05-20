@@ -649,3 +649,152 @@ describe('FleetHub /publish — HMAC replay protection (TASK-051)', () => {
     expect(res.status).toBe(401)
   })
 })
+
+// ============================================================================
+// TASK-057 — DO consults JWT blocklist on WS frames.
+//
+// On /upgrade the DO does a single BLOCKLIST_KV.get(jti) before accepting.
+// On every 10th `webSocketMessage` the DO re-checks (cache TTL 60s) and
+// closes with code 4001 + reason "token revoked" if the jti now exists in
+// the blocklist. Tests mutate the binding's KV store directly via env
+// (cloudflare:test exposes BLOCKLIST_KV as a real Miniflare-backed namespace).
+// ============================================================================
+
+describe('FleetHub /upgrade — blocklist consult (TASK-057)', () => {
+  // Helpers reach into the test env. The KV binding is declared on the
+  // FleetHub project in vitest.config.ts (added alongside this task).
+  function blocklistKV(): KVNamespace {
+    // env is typed loosely by cloudflare:test; cast for the binding we added.
+    return (env as unknown as { BLOCKLIST_KV: KVNamespace }).BLOCKLIST_KV
+  }
+
+  it('rejects /upgrade when the jti is already in the blocklist (401)', async () => {
+    const jti = `revoked-on-upgrade-${Date.now()}`
+    await blocklistKV().put(jti, 'revoked')
+    const tok = await signValidJwt({ sub: 'driver-blocked' })
+    // signValidJwt above hardcodes jti='jti-test'. Re-sign with our jti.
+    const now = Math.floor(Date.now() / 1000)
+    const tokWithJti = await sign(
+      {
+        iss: 'mini-fleet-tracker',
+        sub: 'driver-blocked',
+        role: 'driver',
+        jti,
+        iat: now,
+        nbf: now,
+        exp: now + 60,
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256' },
+    )
+    void tok // unused but kept to mirror existing helper conventions
+
+    const res = await SELF.fetch('https://test.example/upgrade', {
+      method: 'GET',
+      headers: {
+        Upgrade: 'websocket',
+        Origin: ALLOWED_ORIGIN,
+        Cookie: `auth_token=${tokWithJti}`,
+      },
+    })
+    expect(res.status).toBe(401)
+    expect(await res.text()).toBe('token revoked')
+
+    // Cleanup so a later test reusing the same jti isn't poisoned.
+    await blocklistKV().delete(jti)
+  })
+
+  it('accepts /upgrade when the jti is NOT in the blocklist (101)', async () => {
+    const now = Math.floor(Date.now() / 1000)
+    const tok = await sign(
+      {
+        iss: 'mini-fleet-tracker',
+        sub: 'driver-clean',
+        role: 'driver',
+        jti: `clean-${Date.now()}`,
+        iat: now,
+        nbf: now,
+        exp: now + 60,
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256' },
+    )
+    const res = await SELF.fetch('https://test.example/upgrade', {
+      method: 'GET',
+      headers: {
+        Upgrade: 'websocket',
+        Origin: ALLOWED_ORIGIN,
+        Cookie: `auth_token=${tok}`,
+      },
+    })
+    expect(res.status).toBe(101)
+    expect(res.webSocket).not.toBeNull()
+    // accept() before close() — the test-side WebSocket is in CONNECTING
+    // state until either side accepts. Matches the existing pattern in the
+    // "broadcasts to the socket" test above.
+    res.webSocket!.accept()
+    res.webSocket!.close(1000, 'test done')
+  })
+
+  it('closes an active WS with code 4001 when the jti is revoked mid-session', async () => {
+    // Open a fresh WS, then write to the blocklist, then send a string of
+    // pings. Within ~10 frames the DO must consult KV and close 4001.
+    const jti = `revoked-mid-${Date.now()}`
+    const now = Math.floor(Date.now() / 1000)
+    const tok = await sign(
+      {
+        iss: 'mini-fleet-tracker',
+        sub: 'driver-mid',
+        role: 'driver',
+        jti,
+        iat: now,
+        nbf: now,
+        exp: now + 60,
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256' },
+    )
+
+    const res = await SELF.fetch('https://test.example/upgrade', {
+      method: 'GET',
+      headers: {
+        Upgrade: 'websocket',
+        Origin: ALLOWED_ORIGIN,
+        Cookie: `auth_token=${tok}`,
+      },
+    })
+    expect(res.status).toBe(101)
+    const ws = res.webSocket!
+    ws.accept()
+
+    // Revoke after the WS is open.
+    await blocklistKV().put(jti, 'revoked')
+
+    // Wait for the close. We send pings to drive webSocketMessage hooks
+    // and observe the close event. Race with a timeout so a regression
+    // surfaces as a test failure rather than a hang.
+    const closed = new Promise<{ code: number; reason: string }>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('no close within 2s')), 2000)
+      ws.addEventListener('close', (ev: CloseEvent) => {
+        clearTimeout(timeout)
+        resolve({ code: ev.code, reason: ev.reason })
+      })
+    })
+
+    // Send up to 20 pings to be safe — the DO must check at least once
+    // within that window regardless of the sample rate.
+    for (let i = 0; i < 20; i++) {
+      try {
+        ws.send('ping')
+      } catch {
+        break // socket already closed by the DO
+      }
+    }
+
+    const ev = await closed
+    expect(ev.code).toBe(4001)
+    expect(ev.reason).toBe('token revoked')
+
+    await blocklistKV().delete(jti)
+  })
+})

@@ -44,6 +44,10 @@ export interface Env {
   INTERNAL_PUBLISH_SECRET: string
   ALLOWED_ORIGINS: string
   FLEET_HUB: DurableObjectNamespace<FleetHub>
+  // TASK-057 — Session/blocklist KV. Backend Go writes `<jti>` keys here
+  // on logout via cfclient.kvSessions. The DO reads them to close revoked
+  // WS connections promptly. Namespace name in CF: `fleet-kv-sessions`.
+  BLOCKLIST_KV: KVNamespace
 }
 
 // FleetEvent is the wire format published by Go and broadcast verbatim.
@@ -84,7 +88,44 @@ interface FleetClaims {
 const ISSUER = 'mini-fleet-tracker'
 const AUTH_COOKIE_NAME = 'auth_token'
 
+// TASK-057 — Blocklist check parameters.
+//
+// BLOCKLIST_CHECK_EVERY_N: sample rate on `webSocketMessage`. The only
+// frame today is the keepalive "ping", so a per-frame check would be
+// pure overhead. Sampling every 10th message bounds KV reads to roughly
+// once per minute per connection (browsers ping ~6/min). Combined with
+// the on-upgrade check below, an attacker who keeps an old JWT after
+// logout still loses fan-out within seconds of their next ping burst.
+//
+// BLOCKLIST_CACHE_TTL_MS: positive results (jti present in KV) are cached
+// for 60s. Negative results are NOT cached: once revoked, a token never
+// un-revokes, so we don't waste a cache slot on the common "still valid"
+// answer and we keep the check responsive to a logout.
+const BLOCKLIST_CHECK_EVERY_N = 10
+const BLOCKLIST_CACHE_TTL_MS = 60_000
+
+// AttachmentV2 is the JWT-claims payload we serialize onto every accepted
+// WebSocket. Adds `jti` and `msgCount` over the v1 shape from TASK-012
+// (sub/role/exp only). The hibernation API persists the attachment
+// across DO evictions; deserialize defaults missing fields so a socket
+// opened pre-upgrade still works after the new code lands.
+interface AttachmentV2 {
+  sub: string
+  role: string
+  exp: number
+  jti: string
+  msgCount: number
+}
+
 export class FleetHub extends DurableObject<Env> {
+  // Per-DO-instance cache of "this jti is revoked". Cleared on DO eviction
+  // (Map starts empty after wake) — that's fine, the first message after
+  // wake re-hits KV. We never cache "not revoked" because a logout that
+  // happens during the cache window must still close the socket
+  // promptly. Keyed by jti for O(1) lookup; entries dropped on
+  // webSocketClose/Error so a churn of short-lived connections doesn't
+  // bloat the map.
+  private readonly blocklistCache = new Map<string, { expiresAt: number }>()
   override async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url)
     switch (url.pathname) {
@@ -222,23 +263,70 @@ export class FleetHub extends DurableObject<Env> {
       return new Response('invalid token', { status: 401 })
     }
 
-    // 4. Accept the upgrade. Hibernation-capable.
+    // 4. Blocklist short-circuit (TASK-057). If the user already logged
+    // out and their jti is in BLOCKLIST_KV, fail closed before accepting
+    // the upgrade — no point spending DO state on a doomed socket. We
+    // only check when a jti is present; tokens minted before TASK-057
+    // shipped don't carry one and we let those through (they'll expire
+    // naturally within minutes).
+    const jti = claims.jti ?? ''
+    if (jti !== '') {
+      const revoked = await this.checkBlocklist(jti)
+      if (revoked) {
+        return new Response('token revoked', { status: 401 })
+      }
+    }
+
+    // 5. Accept the upgrade. Hibernation-capable.
     const pair = new WebSocketPair()
     const client = pair[0]
     const server = pair[1]
     this.ctx.acceptWebSocket(server)
     // Attach claim metadata so future per-connection logic (e.g. role
-    // filtering) can read it without re-verifying the token. The
-    // hibernation API persists attachments across eviction.
-    server.serializeAttachment({
+    // filtering, blocklist re-check) can read it without re-verifying
+    // the token. The hibernation API persists attachments across eviction.
+    // msgCount drives the sampled blocklist re-check in webSocketMessage.
+    const attachment: AttachmentV2 = {
       sub: claims.sub ?? '',
       role: claims.role ?? '',
       // exp lets us drop sockets whose token aged past the boundary on
       // the next message — useful when TASK-030's DEMO_EXPIRES_AT lands.
       exp: claims.exp ?? 0,
-    })
+      jti,
+      msgCount: 0,
+    }
+    server.serializeAttachment(attachment)
 
     return new Response(null, { status: 101, webSocket: client })
+  }
+
+  // checkBlocklist returns true iff the jti is present in BLOCKLIST_KV.
+  // Positive results are cached for BLOCKLIST_CACHE_TTL_MS to bound KV
+  // costs on chatty connections; negatives are NOT cached so a logout
+  // closes sockets within the next sample window. KV errors are treated
+  // as "not revoked" (fail-open) to avoid disconnecting every active
+  // user during a transient KV outage — the trade-off matches the
+  // existing rate-limit posture in the Go middleware. Logged at warn so
+  // a sustained outage is observable.
+  private async checkBlocklist(jti: string): Promise<boolean> {
+    const now = Date.now()
+    const cached = this.blocklistCache.get(jti)
+    if (cached && cached.expiresAt > now) {
+      return true
+    }
+    try {
+      const value = await this.env.BLOCKLIST_KV.get(jti)
+      if (value !== null) {
+        this.blocklistCache.set(jti, { expiresAt: now + BLOCKLIST_CACHE_TTL_MS })
+        return true
+      }
+      return false
+    } catch (err) {
+      // Fail open: a KV blip must not disconnect every active dashboard.
+      // Logged so observability surfaces sustained errors.
+      console.warn('fleet-hub: BLOCKLIST_KV.get failed, fail-open:', err)
+      return false
+    }
   }
 
   // ----- Hibernation hooks -----
@@ -246,10 +334,45 @@ export class FleetHub extends DurableObject<Env> {
   // The client doesn't push application messages today. We only honour a
   // string "ping" so a browser-level keepalive can probe liveness. Other
   // payloads are dropped silently (don't disconnect — be permissive).
+  //
+  // TASK-057: every BLOCKLIST_CHECK_EVERY_N frames we also re-consult the
+  // blocklist. If the connection's jti is now revoked, the DO closes with
+  // code 4001 + reason "token revoked". The counter rides on the
+  // attachment so it survives hibernation; we update via
+  // serializeAttachment which the runtime persists on the next yield.
   override async webSocketMessage(
     ws: WebSocket,
     message: ArrayBuffer | string,
   ): Promise<void> {
+    // Read + bump the counter. deserializeAttachment may return v1-shaped
+    // payloads from sockets that opened before this code rolled out — we
+    // default the missing fields rather than reject those connections.
+    const raw = ws.deserializeAttachment() as Partial<AttachmentV2> | null
+    const att: AttachmentV2 = {
+      sub: raw?.sub ?? '',
+      role: raw?.role ?? '',
+      exp: raw?.exp ?? 0,
+      jti: raw?.jti ?? '',
+      msgCount: (raw?.msgCount ?? 0) + 1,
+    }
+    ws.serializeAttachment(att)
+
+    // Sampled blocklist re-check. We use 1, BLOCKLIST_CHECK_EVERY_N+1,
+    // ... so the first message after upgrade triggers a check (defence
+    // against a race where logout lands in the same window as the WS
+    // accept). att.msgCount % N === 1 catches that pattern cleanly.
+    if (att.jti !== '' && att.msgCount % BLOCKLIST_CHECK_EVERY_N === 1) {
+      const revoked = await this.checkBlocklist(att.jti)
+      if (revoked) {
+        try {
+          ws.close(4001, 'token revoked')
+        } catch {
+          /* socket already gone — webSocketError will fire if relevant */
+        }
+        return
+      }
+    }
+
     if (typeof message === 'string' && message === 'ping') {
       try {
         ws.send('pong')
@@ -259,20 +382,28 @@ export class FleetHub extends DurableObject<Env> {
     }
   }
 
-  // No per-connection state to clean up — the attachment lives on `ws`
-  // and disappears with it. Implementing the hook is still required so
-  // the runtime can deliver the close to a hibernated DO.
+  // Prune the blocklist cache entry for this connection so a long-running
+  // DO doesn't accumulate stale jti keys for closed sessions. Safe to call
+  // for sockets whose jti was never cached.
   override async webSocketClose(
-    _ws: WebSocket,
+    ws: WebSocket,
     _code: number,
     _reason: string,
     _wasClean: boolean,
   ): Promise<void> {
-    // intentionally empty
+    const att = ws.deserializeAttachment() as Partial<AttachmentV2> | null
+    if (att?.jti) {
+      this.blocklistCache.delete(att.jti)
+    }
   }
 
-  override async webSocketError(_ws: WebSocket, _error: unknown): Promise<void> {
-    // intentionally empty — runtime logs the error.
+  override async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+    // Same cleanup as webSocketClose. The runtime logs the underlying
+    // error; we just keep the cache lean.
+    const att = ws.deserializeAttachment() as Partial<AttachmentV2> | null
+    if (att?.jti) {
+      this.blocklistCache.delete(att.jti)
+    }
   }
 }
 

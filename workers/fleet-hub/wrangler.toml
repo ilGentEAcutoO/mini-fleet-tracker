@@ -28,6 +28,19 @@ class_name = "FleetHub"
 tag = "v1"
 new_sqlite_classes = ["FleetHub"]
 
+# Session/blocklist KV — shared with the Go API. The backend's auth
+# usecase writes a `blocklist:<jti>` key on logout; the DO consults this
+# binding on every Nth WebSocket frame (and on /upgrade) to close
+# revoked sessions promptly instead of letting them ride until the
+# token's natural `exp`. Namespace name: `fleet-kv-sessions` (see
+# instruction/work/deploy-resources.md). The ID is the same namespace
+# the Go container uses; binding name differs because each consumer
+# names its own binding (Go calls it `kvSessions`, the DO calls it
+# `BLOCKLIST_KV` for clarity about its single purpose here).
+[[kv_namespaces]]
+binding = "BLOCKLIST_KV"
+id = "b57b99fc9d164f029c654474b960af05"
+
 # Public-facing vars. Secrets (JWT_SECRET, INTERNAL_PUBLISH_SECRET) are
 # loaded from .dev.vars locally and via `wrangler secret put` in prod.
 [vars]
