@@ -772,3 +772,64 @@ describe('TASK-051: /internal/publish HMAC fallback verifier', () => {
     expect(res.status).toBe(204)
   })
 })
+
+// ============================================================================
+// TASK-056 — /healthz strict equality demo-expiry bypass
+// ============================================================================
+//
+// Previously `path.endsWith('/healthz')` let any URL ending in /healthz
+// (e.g. /api/something/healthz) escape the demo-expiry 410. The fix is
+// strict equality on the two canonical paths only: '/healthz' and
+// '/api/healthz'.
+
+describe('TASK-056: demo-expiry /healthz strict equality', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('returns 410 for /foo/healthz after the cutoff (was bypassed by the broad endsWith match)', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    const res = await SELF.fetch('https://gateway.example/foo/healthz', {
+      method: 'GET',
+      headers: { Origin: ALLOWED_ORIGIN },
+    })
+    expect(res.status).toBe(410)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('demo_expired')
+  })
+
+  it('returns 410 for /api/something/healthz after the cutoff', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    const res = await SELF.fetch('https://gateway.example/api/something/healthz', {
+      method: 'GET',
+      headers: { Origin: ALLOWED_ORIGIN },
+    })
+    expect(res.status).toBe(410)
+  })
+
+  it('still bypasses /healthz exactly after the cutoff', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    const res = await SELF.fetch('https://gateway.example/healthz', {
+      method: 'GET',
+    })
+    // /healthz has no explicit route on the gateway — it 404s in normal
+    // operation. The point is it's NOT 410: the demo-expiry guard does
+    // not intercept the canonical /healthz path.
+    expect(res.status).not.toBe(410)
+  })
+
+  it('still bypasses /api/healthz exactly after the cutoff (forwarded to FLEET_API stub)', async () => {
+    vi.setSystemTime(new Date('2026-06-01T17:00:00Z'))
+    const res = await SELF.fetch('https://gateway.example/api/healthz', {
+      method: 'GET',
+      headers: { Origin: ALLOWED_ORIGIN },
+    })
+    // Whatever the upstream returns, it must NOT be 410 — the
+    // demo-expiry guard does not intercept the canonical /api/healthz.
+    expect(res.status).not.toBe(410)
+  })
+})

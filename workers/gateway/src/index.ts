@@ -93,12 +93,21 @@ export default {
       return handleCORSPreflight(req, env)
     }
 
-    // Demo expiration short-circuit (TASK-030). /healthz forwards
-    // through so a monitor can still see the upstream's per-dep status;
-    // every other path returns the 410 envelope without touching the
-    // Container. This is what makes the cost-protection real: the
+    // Demo expiration short-circuit (TASK-030). /healthz and /api/healthz
+    // forward through so a monitor can still see the upstream's per-dep
+    // status; every other path returns the 410 envelope without touching
+    // the Container. This is what makes the cost-protection real: the
     // Worker handles the request itself, the Container never wakes.
-    if (new Date() > DEMO_EXPIRES_AT && !path.endsWith('/healthz')) {
+    //
+    // TASK-056: strict equality only. The prior `endsWith('/healthz')`
+    // also exempted /foo/healthz / /api/anything/healthz — broad enough
+    // for an attacker to dodge the 410 by appending the suffix. Bounded
+    // by routing rules in practice but tighten anyway.
+    if (
+      new Date() > DEMO_EXPIRES_AT &&
+      path !== '/healthz' &&
+      path !== '/api/healthz'
+    ) {
       return new Response(
         JSON.stringify({
           error: 'demo_expired',
