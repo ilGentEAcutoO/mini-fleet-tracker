@@ -764,3 +764,68 @@ func TestSanitiseFilename(t *testing.T) {
 		})
 	}
 }
+
+// TestSanitiseFilename_RejectsWindowsReservedNames exercises the guard
+// added by TASK-060 (security review L3). Windows reserved device names
+// (CON, PRN, AUX, NUL, COM1-9, LPT1-9 — case-insensitive — with or
+// without extension) must be rejected with ErrValidation so a future
+// Windows-hosted consumer of these R2 objects cannot synthesise a name
+// that shadows a device. The check happens after the existing
+// sanitisation so the regex compares the canonical short name.
+func TestSanitiseFilename_RejectsWindowsReservedNames(t *testing.T) {
+	reserved := []string{
+		"con", "CON", "Con",
+		"prn", "PRN",
+		"aux", "AUX",
+		"nul", "NUL",
+		"com1", "COM1", "com2", "com9",
+		"lpt1", "LPT1", "lpt2", "lpt9",
+		"con.jpg", "CON.JPG", "Con.txt",
+		"prn.png", "aux.log",
+		"com1.bin", "LPT5.dat",
+	}
+	for _, name := range reserved {
+		t.Run(name, func(t *testing.T) {
+			out, err := sanitiseFilename(name)
+			if err == nil {
+				t.Fatalf("sanitiseFilename(%q) = %q, want ErrValidation (reserved Windows name)", name, out)
+			}
+			if !errors.Is(err, domain.ErrValidation) {
+				t.Errorf("sanitiseFilename(%q) err = %v, want ErrValidation", name, err)
+			}
+		})
+	}
+}
+
+// TestSanitiseFilename_AllowsLookalikes confirms the regex is strict —
+// names that LOOK like reserved devices but aren't (CON_, CONS, COM,
+// LPT0, LPT10, README) must keep working. The reserved set is exactly
+// CON/PRN/AUX/NUL and COM[1-9]/LPT[1-9] — nothing else.
+func TestSanitiseFilename_AllowsLookalikes(t *testing.T) {
+	ok := []string{
+		"console.log",
+		"prnted.jpg",
+		"auxiliary.png",
+		"null.dat",
+		"com.png",  // no digit
+		"com0.bin", // 0 is not 1-9
+		"com10.bin",
+		"lpt.png",
+		"lpt0.dat",
+		"lpt10.txt",
+		"readme.md",
+		"con_.jpg",
+		"cons.txt",
+	}
+	for _, name := range ok {
+		t.Run(name, func(t *testing.T) {
+			out, err := sanitiseFilename(name)
+			if err != nil {
+				t.Fatalf("sanitiseFilename(%q) err = %v, want nil (not reserved)", name, err)
+			}
+			if out == "" {
+				t.Fatalf("sanitiseFilename(%q) returned empty string", name)
+			}
+		})
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,18 @@ import (
 
 	"github.com/ilGentEAcutoO/mini-fleet-tracker/backend/internal/domain"
 )
+
+// windowsReservedFilename matches the Windows reserved device names that
+// must not appear as a file basename (with or without extension). On a
+// Windows-hosted file consumer these names shadow OS-level devices and
+// trigger surprising failures or, worse, side-effects (e.g. writing to
+// CON sends bytes to the console). R2 itself does not care, but bytes
+// downloaded from R2 onto a Windows system would. See security review L3.
+//
+// Pattern matches: CON, PRN, AUX, NUL, COM1-9, LPT1-9 — case-insensitive,
+// optionally followed by a single dot + extension (no further dots so
+// "console.log" still passes — see TestSanitiseFilename_AllowsLookalikes).
+var windowsReservedFilename = regexp.MustCompile(`^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.[^.]*)?$`)
 
 // quotaStore is the narrow KV contract PhotoUsecase needs for the
 // per-vehicle daily quota. Declared at the consumer site so the usecase
@@ -443,6 +456,14 @@ func sanitiseFilename(in string) (string, error) {
 	out := strings.Trim(b.String(), ".")
 	if out == "" {
 		return "", fmt.Errorf("filename %q sanitised to empty: %w", in, domain.ErrValidation)
+	}
+	// Reject Windows reserved device names AFTER the character sanitisation
+	// so the regex compares the canonical short name. A Windows-hosted
+	// consumer would treat "CON" or "CON.JPG" as the console device; the
+	// R2 bucket itself is happy with anything, but bytes downloaded out of
+	// it should not weaponise the destination filesystem. Security review L3.
+	if windowsReservedFilename.MatchString(out) {
+		return "", fmt.Errorf("filename %q is a reserved Windows device name: %w", in, domain.ErrValidation)
 	}
 	return out, nil
 }
