@@ -88,6 +88,7 @@ type captured struct {
 	path        string
 	contentType string
 	signature   string
+	timestamp   string
 	body        []byte
 }
 
@@ -101,6 +102,7 @@ func TestPublishPositionUpdate_PostsExpectedRequest(t *testing.T) {
 		got.path = r.URL.Path
 		got.contentType = r.Header.Get("Content-Type")
 		got.signature = r.Header.Get("X-Signature")
+		got.timestamp = r.Header.Get("X-Timestamp")
 		got.body, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
 	})
@@ -133,13 +135,19 @@ func TestPublishPositionUpdate_PostsExpectedRequest(t *testing.T) {
 
 	// X-Signature must be present. The signature value itself is
 	// DurableClient's concern (the cfclient test suite verifies the
-	// HMAC byte-for-byte); here we just confirm a hex digest of the
-	// right length actually rode along.
+	// HMAC byte-for-byte against the new contract); here we just
+	// confirm a hex digest of the right length actually rode along.
 	if got.signature == "" {
 		t.Error("X-Signature header must be set")
 	}
 	if len(got.signature) != 64 {
 		t.Errorf("X-Signature length = %d, want 64 (sha256 hex)", len(got.signature))
+	}
+	// TASK-051: X-Timestamp must accompany every publish. The DO + gateway
+	// verifier accept the new HMAC contract only when both headers ride
+	// together; the cfclient layer is responsible for both.
+	if got.timestamp == "" {
+		t.Error("X-Timestamp header must be set (TASK-051 replay protection)")
 	}
 
 	// Body must round-trip into the wire-shape struct with every field
@@ -258,6 +266,7 @@ func TestPublishGeofenceAlert_PostsExpectedRequest(t *testing.T) {
 		got.path = r.URL.Path
 		got.contentType = r.Header.Get("Content-Type")
 		got.signature = r.Header.Get("X-Signature")
+		got.timestamp = r.Header.Get("X-Timestamp")
 		got.body, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
 	})
@@ -277,6 +286,12 @@ func TestPublishGeofenceAlert_PostsExpectedRequest(t *testing.T) {
 	}
 	if got.signature == "" {
 		t.Error("X-Signature header must be set")
+	}
+	// TASK-051: X-Timestamp must accompany geofence.alert publishes too —
+	// the DO verifier requires both headers in the new mode for every
+	// event type, not just position.update.
+	if got.timestamp == "" {
+		t.Error("X-Timestamp header must be set on geofence.alert too (TASK-051)")
 	}
 
 	// Body must round-trip into the wire-shape struct.
