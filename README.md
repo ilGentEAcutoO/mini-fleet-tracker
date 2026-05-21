@@ -67,7 +67,7 @@ One hostname — `fleet-tracker.jairukchan.com` — fronts everything. The gatew
 
 **Backend — Go (production code path)**
 
-- Go 1.23, Fiber v2
+- Go 1.25, Fiber v2
 - Clean architecture: `domain → usecase → repository → cfclient`
 - `golang-jwt/jwt/v5` (HS256 with `WithValidMethods` pin), `argon2id` per RFC 9106 (m=64 MB, t=3, p=2)
 - `validator/v10`, `viper`, `zerolog` with request-scoped logger

@@ -372,7 +372,7 @@ Layered, demonstrating patterns rather than chasing coverage numbers.
 
 **Structured logging with request-scoped context.** `zerolog` is initialised in `configureLogger` (console for dev, JSON for production). The `Logger` middleware seeds a per-request `X-Request-Id` (generated or accepted from upstream) and stuffs the request-scoped logger into `c.UserContext()`. Every downstream log line carries `req_id`, `method`, `path`, `status`, `latency_ms` automatically.
 
-**Container hygiene.** Multi-stage Dockerfile: `golang:1.23-alpine` build → `gcr.io/distroless/static-debian12` runtime. The runtime image carries no shell, no package manager, no curl. The binary runs as `nonroot` UID 65532. Image size lands around 18 MB.
+**Container hygiene.** Multi-stage Dockerfile: `golang:1.25-alpine` build → `gcr.io/distroless/static-debian12` runtime. The runtime image carries no shell, no package manager, no curl. The binary runs as `nonroot` UID 65532. Image size lands around 18 MB.
 
 **Build metadata.** `gitCommit` is stamped at build time via `-ldflags "-X main.gitCommit=$(git rev-parse --short HEAD)"` and surfaced in `/healthz`. The Makefile target wires it automatically.
 
