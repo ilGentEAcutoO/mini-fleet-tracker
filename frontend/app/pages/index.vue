@@ -9,11 +9,19 @@ const { loginAs, submitting, errorMessage } = useDemoLogin()
 // If already authenticated (e.g. browser remembers cookies from a prior visit),
 // jump straight to the dashboard. Client-only so SSR returns the landing for
 // SEO and the redirect happens during hydration.
+//
+// Otherwise: auto-trigger manager login so a fresh visitor lands on the
+// dashboard without an extra click. The "Try as Driver" button stays
+// visible during the ~1s auto-login window for users who want the driver
+// surface instead — they can also navigate via /login at any time. Demo
+// expiry (2026-05-31) is enforced server-side independent of this flow.
 onMounted(async () => {
   if (!auth.fetched) await auth.fetchMe()
   if (auth.isAuthenticated) {
     await router.push(auth.isManager ? '/dashboard' : '/driver/report')
+    return
   }
+  loginAs('manager')
 })
 </script>
 

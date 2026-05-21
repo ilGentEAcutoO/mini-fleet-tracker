@@ -40,6 +40,17 @@ async function fetchVehicles(): Promise<void> {
   try {
     const res = await api<{ vehicles: Vehicle[] }>('/vehicles')
     vehicles.value = res.vehicles
+    // Prune stale state: when a vehicle is deleted on /dashboard/vehicles
+    // and the user returns here, its last position and seeded playback track
+    // would otherwise keep its marker frozen on the map. Drop both so the
+    // marker layer also drops it on the next syncMarkers tick.
+    const idSet = new Set(vehicles.value.map(v => v.id))
+    for (const id of [...fleet.positions.keys()]) {
+      if (!idSet.has(id)) fleet.positions.delete(id)
+    }
+    for (const id of [...playbackTracks.value.keys()]) {
+      if (!idSet.has(id)) playbackTracks.value.delete(id)
+    }
   }
   catch (err: unknown) {
     const e = err as { data?: { message?: string } } | undefined
@@ -63,6 +74,14 @@ async function fetchVehicles(): Promise<void> {
 // /driver/report) overrides the playback for that vehicle.
 const playbackTracks = ref(new Map<string, Position[]>())
 let playbackHandle: ReturnType<typeof setInterval> | null = null
+// Anchor for playback's "elapsed since start" math. We deliberately do NOT
+// compare Date.now() against position.recorded_at because the publisher's
+// clock can drift from the browser's — including a full +543yr offset if a
+// Container or sim host ever stamps positions with a Buddhist-Era display
+// clock. Anchoring on a browser-side mount-time means the cars loop through
+// their tracks once per `span` ms regardless of any server-side epoch
+// weirdness. The track is still walked in order via the `first..last` range.
+const playbackAnchor = ref(0)
 
 async function loadPlaybackTracks(): Promise<void> {
   if (!auth.isManager) return
@@ -80,6 +99,9 @@ async function loadPlaybackTracks(): Promise<void> {
       // Per-vehicle fetch failures are non-fatal — other vehicles still animate.
     }
   }))
+  // Anchor playback to "now" after tracks are loaded so the first visible
+  // frame starts at track[0].
+  playbackAnchor.value = Date.now()
 }
 
 function tickPlayback(): void {
@@ -93,8 +115,9 @@ function tickPlayback(): void {
       fleet.positions.set(vehicleId, track[0]!)
       continue
     }
-    // Map current wall time into the track via modulo: track loops every `span`.
-    const elapsed = ((now - first) % span + span) % span
+    // Map elapsed-since-anchor into the track via modulo: track loops every
+    // `span` ms. See `playbackAnchor` comment for why we don't use wall-clock.
+    const elapsed = ((now - playbackAnchor.value) % span + span) % span
     const target = first + elapsed
     // Binary-ish linear scan for the bracketing pair. Cheap for ~60 points.
     let i = 0
