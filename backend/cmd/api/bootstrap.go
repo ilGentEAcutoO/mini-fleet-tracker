@@ -394,6 +394,16 @@ func setupApp(cfg *config.Config) (*fiber.App, func(), error) {
 	app.Get("/healthz", healthzRL, healthzHandler.Check)
 
 	api := app.Group("/api")
+
+	// Alias for /healthz so the gateway can forward /api/healthz without
+	// hitting a 404. The gateway's expiry short-circuit already exempts
+	// /api/healthz as a sibling of /healthz (workers/gateway/src/index.ts);
+	// this is the backend half of that contract. No per-route healthzRL
+	// here: the global per-IP 600/min cap is the only guard. Acceptable at
+	// demo scale (single legitimate consumer, low absolute traffic); revisit
+	// if the demo is revived with a public monitor pointed at /api/healthz.
+	api.Get("/healthz", healthzHandler.Check)
+
 	auth := api.Group("/auth")
 
 	// Public auth endpoints — no auth cookie, no CSRF (CSRF cookie does
