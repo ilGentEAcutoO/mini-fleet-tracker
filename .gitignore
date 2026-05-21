@@ -29,6 +29,7 @@ vendor/
 *.log
 tmp/
 agent-temp/
+.playwright-mcp/
 .gocache/
 .gomodcache/
 
