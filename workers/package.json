@@ -11,7 +11,8 @@
     "dev:gateway": "wrangler dev --config gateway/wrangler.toml",
     "dev:hub": "wrangler dev --config fleet-hub/wrangler.toml",
     "deploy:gateway": "wrangler deploy --config gateway/wrangler.toml",
-    "deploy:hub": "wrangler deploy --config fleet-hub/wrangler.toml"
+    "deploy:hub": "wrangler deploy --config fleet-hub/wrangler.toml",
+    "deploy:api": "node api/deploy.mjs"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.4",

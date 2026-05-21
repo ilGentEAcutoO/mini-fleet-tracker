@@ -18,6 +18,13 @@ compatibility_flags = ["nodejs_compat"]
 class_name = "FleetAPI"
 image = "../../backend/Dockerfile"
 max_instances = 1
+# Build arg passed through to backend/Dockerfile's `ARG GIT_COMMIT`,
+# which threads it into `go build -ldflags "-X main.gitCommit=..."`. The
+# resulting binary surfaces the SHA in /healthz responses so operators
+# can confirm which build is live. Sentinel value "dev" is overwritten
+# by api/deploy.mjs before invoking `wrangler deploy`; if you see
+# "dev" in a production response you bypassed the deploy wrapper.
+image_vars = { GIT_COMMIT = "dev" }
 
 [[durable_objects.bindings]]
 name = "FLEET_API"
