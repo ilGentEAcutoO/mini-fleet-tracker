@@ -50,11 +50,6 @@ async function signValidJwt(opts?: {
   )
 }
 
-// Helper: hex-sign a body the way Go's cfclient.DurableClient does.
-async function signBody(secret: string, body: string): Promise<string> {
-  return hmacSha256Hex(secret, new TextEncoder().encode(body))
-}
-
 // ============================================================================
 // Pure helpers — no runtime bindings needed.
 // ============================================================================
@@ -235,10 +230,18 @@ describe('FleetHub /publish', () => {
 
   it('rejects invalid JSON with a valid signature (400)', async () => {
     const body = 'not json {{'
-    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const ts = String(Math.floor(Date.now() / 1000))
+    const sig = await hmacSha256Hex(
+      INTERNAL_PUBLISH_SECRET,
+      new TextEncoder().encode(body + '\n' + ts),
+    )
     const res = await SELF.fetch('https://test.example/publish', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
       body,
     })
     expect(res.status).toBe(400)
@@ -246,10 +249,18 @@ describe('FleetHub /publish', () => {
 
   it('rejects unsupported event types with a valid signature (400)', async () => {
     const body = JSON.stringify({ type: 'unknown.event' })
-    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const ts = String(Math.floor(Date.now() / 1000))
+    const sig = await hmacSha256Hex(
+      INTERNAL_PUBLISH_SECRET,
+      new TextEncoder().encode(body + '\n' + ts),
+    )
     const res = await SELF.fetch('https://test.example/publish', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
       body,
     })
     expect(res.status).toBe(400)
@@ -263,10 +274,18 @@ describe('FleetHub /publish', () => {
       lng: 100.5,
       recorded_at: 1716000000,
     })
-    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const ts = String(Math.floor(Date.now() / 1000))
+    const sig = await hmacSha256Hex(
+      INTERNAL_PUBLISH_SECRET,
+      new TextEncoder().encode(body + '\n' + ts),
+    )
     const res = await SELF.fetch('https://test.example/publish', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
       body,
     })
     expect(res.status).toBe(204)
@@ -279,10 +298,18 @@ describe('FleetHub /publish', () => {
       alert_type: 'exit',
       at: 1716000001,
     })
-    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const ts = String(Math.floor(Date.now() / 1000))
+    const sig = await hmacSha256Hex(
+      INTERNAL_PUBLISH_SECRET,
+      new TextEncoder().encode(body + '\n' + ts),
+    )
     const res = await SELF.fetch('https://test.example/publish', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
       body,
     })
     expect(res.status).toBe(204)
@@ -368,10 +395,18 @@ describe('FleetHub /upgrade', () => {
       lng: 2.2,
       recorded_at: 99,
     })
-    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const ts = String(Math.floor(Date.now() / 1000))
+    const sig = await hmacSha256Hex(
+      INTERNAL_PUBLISH_SECRET,
+      new TextEncoder().encode(body + '\n' + ts),
+    )
     const pubRes = await SELF.fetch('https://test.example/publish', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
       body,
     })
     expect(pubRes.status).toBe(204)
@@ -458,10 +493,18 @@ describe('demo expiration', () => {
       lng: 2,
       recorded_at: 99,
     })
-    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const ts = String(Math.floor(Date.now() / 1000))
+    const sig = await hmacSha256Hex(
+      INTERNAL_PUBLISH_SECRET,
+      new TextEncoder().encode(body + '\n' + ts),
+    )
     const res = await SELF.fetch('https://test.example/publish', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
       body,
     })
     expect(res.status).toBe(410)
@@ -510,10 +553,18 @@ describe('demo expiration', () => {
       lng: 2,
       recorded_at: 99,
     })
-    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const ts = String(Math.floor(Date.now() / 1000))
+    const sig = await hmacSha256Hex(
+      INTERNAL_PUBLISH_SECRET,
+      new TextEncoder().encode(body + '\n' + ts),
+    )
     const res = await SELF.fetch('https://test.example/publish', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
       body,
     })
     expect(res.status).toBe(204)
@@ -533,15 +584,14 @@ describe('demo expiration', () => {
 })
 
 // ============================================================================
-// TASK-051 — HMAC replay protection (DO side, fallback mode).
+// TASK-051 — HMAC replay protection (DO side, load-bearing).
 //
-// The new signed envelope is HMAC-SHA256(body || '\n' || ts, secret) with an
-// X-Timestamp header and a ±30s window. While the Go publisher is being
-// rolled out, the DO must keep accepting the legacy body-only signature so
-// in-flight events from an older publisher don't drop. The fallback is
-// "if no X-Timestamp AND the new check would not have applied" → legacy.
+// The signed envelope is HMAC-SHA256(body || '\n' || ts, secret) with an
+// X-Timestamp header and a ±30s window. Outside the window — or with no
+// X-Timestamp — the DO rejects with 401. The 24h legacy body-only
+// fallback has been removed: replay protection is now load-bearing.
 //
-// Bytes-identical contract with the gateway verifier (Bravo-2):
+// Bytes-identical contract with the gateway verifier:
 //   * separator is the single byte '\n' (0x0a)
 //   * UTF-8 encoding for both body and ts
 //   * lowercase hex output
@@ -584,8 +634,8 @@ describe('FleetHub /publish — HMAC replay protection (TASK-051)', () => {
   it('rejects the new format outside the ±30s window (401)', async () => {
     // 5 minutes in the past — well outside ±30s. Even with a valid signature
     // over `body || \n || ts` for that ts, the DO refuses because the window
-    // closed. Without an X-Timestamp the legacy check would run; here ts is
-    // present so we don't fall back.
+    // closed. There is no second path to fall back to — outside-window
+    // requests are unconditionally 401.
     const ts = String(Math.floor(Date.now() / 1000) - 300)
     const body = JSON.stringify({
       type: 'position.update',
@@ -607,30 +657,10 @@ describe('FleetHub /publish — HMAC replay protection (TASK-051)', () => {
     expect(res.status).toBe(401)
   })
 
-  it('accepts the legacy body-only signature without X-Timestamp (204)', async () => {
-    // Pre-rollout publisher still sends body-only HMAC. Fallback kicks in.
-    const body = JSON.stringify({
-      type: 'position.update',
-      vehicle_id: 'v-legacy',
-      lat: 1,
-      lng: 2,
-      recorded_at: 1,
-    })
-    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body) // body-only
-    const res = await SELF.fetch('https://test.example/publish', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Signature': sig,
-      },
-      body,
-    })
-    expect(res.status).toBe(204)
-  })
-
-  it('rejects when both new and legacy checks fail (401)', async () => {
-    // Garbage signature, no timestamp, valid body. Both verification paths
-    // reject; the DO must respond 401.
+  it('rejects an unsigned-timestamp body-only request (401)', async () => {
+    // Garbage signature, no X-Timestamp header, valid body. The verifier
+    // rejects when X-Timestamp is missing (no fallback path), so the DO
+    // must respond 401.
     const body = JSON.stringify({
       type: 'position.update',
       vehicle_id: 'v-bad',

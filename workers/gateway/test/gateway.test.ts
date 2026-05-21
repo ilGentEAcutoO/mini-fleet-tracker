@@ -20,10 +20,6 @@ const ALLOWED_ORIGIN = 'http://localhost:3000'
 const JWT_SECRET = env.JWT_SECRET
 const INTERNAL_PUBLISH_SECRET = env.INTERNAL_PUBLISH_SECRET
 
-async function signBody(secret: string, body: string): Promise<string> {
-  return hmacSha256Hex(secret, new TextEncoder().encode(body))
-}
-
 async function signValidJwt(): Promise<string> {
   const now = Math.floor(Date.now() / 1000)
   return sign(
@@ -192,10 +188,18 @@ describe('POST /internal/publish', () => {
       lng: 100.5,
       recorded_at: 1716000000,
     })
-    const sig = await signBody(INTERNAL_PUBLISH_SECRET, body)
+    const ts = String(Math.floor(Date.now() / 1000))
+    const sig = await hmacSha256Hex(
+      INTERNAL_PUBLISH_SECRET,
+      new TextEncoder().encode(body + '\n' + ts),
+    )
     const res = await SELF.fetch('https://gateway.example/internal/publish', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Signature': sig },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': sig,
+        'X-Timestamp': ts,
+      },
       body,
     })
     expect(res.status).toBe(204)
@@ -212,10 +216,18 @@ describe('POST /internal/publish', () => {
       lng: 0,
       recorded_at: 0,
     })
-    const wrongSig = await signBody('wrong-secret', body)
+    const ts = String(Math.floor(Date.now() / 1000))
+    const wrongSig = await hmacSha256Hex(
+      'wrong-secret',
+      new TextEncoder().encode(body + '\n' + ts),
+    )
     const res = await SELF.fetch('https://gateway.example/internal/publish', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Signature': wrongSig },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Signature': wrongSig,
+        'X-Timestamp': ts,
+      },
       body,
     })
     expect(res.status).toBe(401)
@@ -629,19 +641,17 @@ describe('TASK-050: /ws upgrade rate limit', () => {
 })
 
 // ============================================================================
-// TASK-051 — /internal/publish HMAC over body + X-Timestamp with legacy
-//             body-only fallback
+// TASK-051 — /internal/publish HMAC over body + X-Timestamp (load-bearing)
 // ============================================================================
 //
-// New contract: signature = HMAC-SHA256(body || "\n" || ts, secret)
-// where ts is the X-Timestamp header (unix seconds, integer-stringified).
-// Verifier accepts within ±30s of "now". If the new check fails OR ts is
-// absent, the verifier falls back to the legacy contract
-// signature = HMAC-SHA256(body, secret). The fallback exists for the 24h
-// rollout window so publisher (backend Go) and verifier (workers) can be
-// deployed in any order without breaking broadcasts.
+// Contract: signature = HMAC-SHA256(body || "\n" || ts, secret) where ts
+// is the X-Timestamp header (unix seconds, integer-stringified). Verifier
+// accepts ONLY within ±30s of "now". Outside the window — or with no
+// X-Timestamp — the request is rejected (401). Replay protection is
+// load-bearing post-rollout: the 24h legacy body-only fallback has been
+// removed on both gateway and hub.
 
-describe('TASK-051: /internal/publish HMAC fallback verifier', () => {
+describe('TASK-051: /internal/publish HMAC verifier', () => {
   const validBody = JSON.stringify({
     type: 'position.update',
     vehicle_id: 'v-task051',
@@ -657,10 +667,6 @@ describe('TASK-051: /internal/publish HMAC fallback verifier', () => {
     )
   }
 
-  async function signLegacyFormat(body: string): Promise<string> {
-    return hmacSha256Hex(INTERNAL_PUBLISH_SECRET, new TextEncoder().encode(body))
-  }
-
   it('accepts a valid new-format signature with X-Timestamp within ±30s', async () => {
     const ts = String(Math.floor(Date.now() / 1000))
     const sig = await signNewFormat(validBody, ts)
@@ -673,19 +679,17 @@ describe('TASK-051: /internal/publish HMAC fallback verifier', () => {
       },
       body: validBody,
     })
-    // DO accepts the relayed body (legacy DO HMAC may still apply during
-    // the 24h transition — Charlie-2 mirrors this fallback on the DO
-    // side). Gateway-side verifier must accept this exact (sig, ts)
-    // pair; the gateway forwards a 204 from the DO.
+    // Gateway-side verifier must accept this exact (sig, ts) pair, then
+    // forward to the DO whose verifier mirrors the same contract. The
+    // gateway returns the DO's 204.
     expect(res.status).toBe(204)
   })
 
   it('rejects a valid signature whose X-Timestamp is outside the ±30s window (401)', async () => {
-    // ts = "1 hour ago" — out of window. The new-mode signature itself
-    // is computed correctly with that ts, so the only thing that should
-    // reject it is the window check. Because the signature DOES depend
-    // on ts, the legacy fallback path (signature over body only) won't
-    // match either — so we expect 401.
+    // ts = "1 hour ago" — out of window. The signature itself is computed
+    // correctly with that ts, so the only thing that should reject it is
+    // the window check; outside the window the verifier returns 401 with
+    // no second path to fall back to.
     const ts = String(Math.floor(Date.now() / 1000) - 3600)
     const sig = await signNewFormat(validBody, ts)
     const res = await SELF.fetch('https://gateway.example/internal/publish', {
@@ -700,37 +704,10 @@ describe('TASK-051: /internal/publish HMAC fallback verifier', () => {
     expect(res.status).toBe(401)
   })
 
-  it('accepts a legacy-format signature (no X-Timestamp header) via 24h fallback', async () => {
-    // Pre-rollout publisher emits body-only HMAC, no X-Timestamp header.
-    // Verifier must accept during the transition window and log mode='legacy'.
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
-    try {
-      const sig = await signLegacyFormat(validBody)
-      const res = await SELF.fetch('https://gateway.example/internal/publish', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Signature': sig,
-        },
-        body: validBody,
-      })
-      expect(res.status).toBe(204)
-      // The gateway must log when the legacy path is hit so the operator
-      // can monitor when it's safe to remove the fallback.
-      const sawLegacyLog = logSpy.mock.calls.some((call) =>
-        call.some(
-          (arg) =>
-            typeof arg === 'string' && arg.includes('hmac_mode=legacy'),
-        ),
-      )
-      expect(sawLegacyLog).toBe(true)
-    } finally {
-      logSpy.mockRestore()
-    }
-  })
-
-  it('rejects a request with neither a valid new-mode signature nor a valid legacy-mode signature (401)', async () => {
-    // Wrong signature in both modes (signed against the wrong secret).
+  it('rejects a request signed with the wrong secret (401)', async () => {
+    // Valid X-Timestamp + correctly-shaped signature but signed against
+    // the wrong secret — the new-mode HMAC compare returns false, the
+    // verifier returns { ok: false }, and there is no fallback to mask it.
     const ts = String(Math.floor(Date.now() / 1000))
     const badSig = await hmacSha256Hex(
       'wrong-secret',
@@ -749,15 +726,12 @@ describe('TASK-051: /internal/publish HMAC fallback verifier', () => {
   })
 
   it('forwards X-Timestamp to the DO so the DO verifier can apply the same logic', async () => {
-    // Charlie-2's DO implements the same fallback. A successful new-mode
-    // signature MUST traverse through to the DO with both X-Signature
-    // and X-Timestamp intact. We assert by sending a request that would
-    // fail at the DO if X-Timestamp wasn't forwarded (e.g. tomorrow
-    // Charlie-2's DO might require X-Timestamp + new-mode). For today
-    // the DO still verifies legacy mode, so the success status (204)
-    // is the assertion that the DO accepted the body relayed by the
-    // gateway — sufficient end-to-end proof that the gateway forwarded
-    // the headers needed for the new-mode path.
+    // The DO now ALSO requires X-Timestamp + new-mode signature — no
+    // legacy fallback on either end. A successful request MUST traverse
+    // to the DO with both X-Signature and X-Timestamp intact, or the DO
+    // returns 401 and the gateway propagates it. A 204 here is therefore
+    // sufficient end-to-end proof that the gateway forwarded the headers
+    // needed for the new-mode path.
     const ts = String(Math.floor(Date.now() / 1000))
     const sig = await signNewFormat(validBody, ts)
     const res = await SELF.fetch('https://gateway.example/internal/publish', {
