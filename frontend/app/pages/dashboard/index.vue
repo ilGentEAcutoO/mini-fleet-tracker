@@ -123,8 +123,10 @@ onMounted(async () => {
   await fetchVehicles()
   await loadPlaybackTracks()
   tickPlayback()
-  // 3s cadence — slow enough to be cheap, fast enough to feel alive.
-  playbackHandle = setInterval(tickPlayback, 3000)
+  // 1s cadence — matches the simulator's ~1 Hz so playback feels continuous
+  // without a chunky jump between ticks. No backend cost (it's interpolation
+  // over preloaded points; no D1 writes happen on each tick).
+  playbackHandle = setInterval(tickPlayback, 1000)
 })
 
 onBeforeUnmount(() => {
