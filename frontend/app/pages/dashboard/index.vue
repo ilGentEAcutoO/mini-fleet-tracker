@@ -85,7 +85,13 @@ const playbackAnchor = ref(0)
 
 async function loadPlaybackTracks(): Promise<void> {
   if (!auth.isManager) return
-  const since = Date.now() - 60 * 60 * 1000
+  // 30-day window: pre-seeded positions don't stay "fresh" (the demo doesn't
+  // run a continuous seeder for cost reasons — see the playback comment above),
+  // so a narrow window can return 0 rows once the seed is hours old and the
+  // map looks broken. Widening to 30d keeps the playback animated against
+  // whatever points exist in D1; the modulo loop already handles older
+  // recorded_at gracefully. Last narrowed 2026-05-22 after seed went stale ~20h.
+  const since = Date.now() - 30 * 24 * 60 * 60 * 1000
   await Promise.all(vehicles.value.map(async (v) => {
     try {
       const res = await api<{ positions: Position[] }>(
