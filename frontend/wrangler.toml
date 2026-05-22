@@ -37,4 +37,8 @@ binding = "ASSETS"
 # Same-origin URLs (production) — active once the Custom Domain deploys.
 NUXT_PUBLIC_API_BASE = "https://fleet-tracker.jairukchan.com/api"
 NUXT_PUBLIC_WS_BASE = "wss://fleet-tracker.jairukchan.com/ws"
-NUXT_PUBLIC_MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty"
+# 2026-05-22: swapped liberty → positron. Minimal cartographic style keeps
+# vehicle markers + history polylines visually dominant, and the positron
+# style's evaluator does not emit the "Expected value to be of type number,
+# but found null" worker warnings that liberty produced for icon/text props.
+NUXT_PUBLIC_MAP_STYLE = "https://tiles.openfreemap.org/styles/positron"

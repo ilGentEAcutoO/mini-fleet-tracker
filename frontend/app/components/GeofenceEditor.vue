@@ -15,7 +15,10 @@
 //   onBeforeUnmount → remove() the map; the SDK detaches everything
 //
 // API contract (manager-only, CSRF on PUT via useApi):
-//   GET /api/vehicles/:id/geofence → 200 { geofence } | 404 if unset
+//   GET /api/vehicles/:id/geofence → 200 { geofence } | 200 { geofence: null }
+//                                    if unset (legacy backends may still
+//                                    return 404 — we accept both during the
+//                                    deploy window)
 //   PUT /api/vehicles/:id/geofence → 200 { geofence }
 //
 // MapLibre note
@@ -67,19 +70,30 @@ async function fetchFence(): Promise<void> {
   loading.value = true
   error.value = null
   try {
-    const res = await api<{ geofence: Geofence }>(
+    const res = await api<{ geofence: Geofence | null }>(
       `/vehicles/${props.vehicleId}/geofence`,
     )
-    fence.value = res.geofence
-    centerLat.value = res.geofence.center_lat
-    centerLng.value = res.geofence.center_lng
-    radiusM.value = res.geofence.radius_m
+    if (res.geofence === null) {
+      // New backend contract: 200 with null body == "not configured yet".
+      // Keep the Bangkok defaults already on centerLat/centerLng/radiusM so
+      // the preview map has somewhere sensible to center on.
+      fence.value = null
+    }
+    else {
+      fence.value = res.geofence
+      centerLat.value = res.geofence.center_lat
+      centerLng.value = res.geofence.center_lng
+      radiusM.value = res.geofence.radius_m
+    }
   }
   catch (err: unknown) {
     const e = err as { data?: { message?: string }, status?: number, statusCode?: number } | undefined
     const status = e?.statusCode ?? e?.status
     if (status === 404) {
-      // 404 is the "not configured yet" path — empty state, no error pill.
+      // Legacy backend path — older Go builds returned 404 instead of
+      // 200+null. Keep this branch during the deploy window so a returning
+      // SPA briefly hitting the old backend (or a fresh SPA briefly hitting
+      // the new one) both land in the empty-state UI cleanly.
       fence.value = null
     }
     else {

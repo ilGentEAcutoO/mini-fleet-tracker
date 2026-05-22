@@ -60,6 +60,16 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function fetchMe(): Promise<void> {
     if (fetched.value) return
+    // Skip the network probe when no session-related cookie exists. The
+    // HttpOnly session cookie itself is invisible to JS, but its sibling
+    // `csrf_token` (set on login, cleared on logout) is a safe proxy. A
+    // fresh visitor has neither → asking /auth/me is guaranteed-401 and
+    // would spam the console for every demo first-load.
+    if (import.meta.client && !document.cookie.includes('csrf_token=')) {
+      user.value = null
+      fetched.value = true
+      return
+    }
     try {
       const { user: u } = await api<{ user: Driver }>('/auth/me')
       user.value = u
