@@ -70,8 +70,12 @@ type geofenceDTO struct {
 // geofenceBody wraps a single geofence for response shaping. Mirrors
 // vehicleBody / positionBody — one shape per entity, predictable for
 // the SPA.
+//
+// Geofence is a pointer so the envelope can marshal `null` when no
+// fence is configured for a vehicle. The Get handler uses that path
+// to surface "unconfigured" as a normal state rather than an error.
 type geofenceBody struct {
-	Geofence geofenceDTO `json:"geofence"`
+	Geofence *geofenceDTO `json:"geofence"`
 }
 
 // toGeofenceDTO copies a domain.Geofence into the API DTO. Nil-safe
@@ -90,21 +94,37 @@ func toGeofenceDTO(g *domain.Geofence) geofenceDTO {
 	}
 }
 
+// toGeofenceDTOPtr returns nil when g is nil, else a pointer to the
+// populated DTO. Lets the JSON envelope marshal a singleton sub-resource
+// as `null` when unconfigured, rather than the zero-value DTO.
+func toGeofenceDTOPtr(g *domain.Geofence) *geofenceDTO {
+	if g == nil {
+		return nil
+	}
+	dto := toGeofenceDTO(g)
+	return &dto
+}
+
 // Get returns the geofence for the :id vehicle. GET
 // /api/vehicles/:id/geofence — manager-only.
 //
 // Status codes:
 //
-//	200 on success (with geofenceBody)
+//	200 always when authorized. The body is `{ "geofence": <dto> }`
+//	    when a fence is configured, or `{ "geofence": null }` when
+//	    unconfigured.
 //	401 missing auth context
 //	403 not a manager
-//	404 no fence set for this vehicle (or the vehicle doesn't exist)
 //	500 on infra failure
 //
-// The 404 path collapses "no fence" and "no vehicle" into the same
-// response — the SPA doesn't need to distinguish (the vehicle-detail
-// page that consumes this only renders the editor below the existing
-// vehicle UI, so it already knows the vehicle exists).
+// A singleton sub-resource that is simply unset is not an error
+// condition, so we collapse the usecase's ErrNotFound — which covers
+// both "no fence configured" and "vehicle id unknown" — into the
+// same 200 + null response. The SPA's vehicle-detail page only
+// renders the geofence editor below an already-loaded vehicle, so it
+// never needs to disambiguate the two cases; returning 200 here also
+// silences a noisy 4xx that the browser logs to DevTools on every
+// page load even when the SPA catches it.
 func (h *GeofenceHandler) Get(c *fiber.Ctx) error {
 	if denied, err := h.denyIfNotManager(c); denied {
 		return err
@@ -112,9 +132,12 @@ func (h *GeofenceHandler) Get(c *fiber.Ctx) error {
 	id := c.Params("id")
 	g, err := h.usecase.GetByVehicle(c.UserContext(), id)
 	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return c.JSON(geofenceBody{Geofence: nil})
+		}
 		return h.mapDomainError(c, err, "could not load geofence")
 	}
-	return c.JSON(geofenceBody{Geofence: toGeofenceDTO(g)})
+	return c.JSON(geofenceBody{Geofence: toGeofenceDTOPtr(g)})
 }
 
 // Put sets (or replaces) the geofence for the :id vehicle. PUT
@@ -157,7 +180,7 @@ func (h *GeofenceHandler) Put(c *fiber.Ctx) error {
 	if err != nil {
 		return h.mapDomainError(c, err, "could not set geofence")
 	}
-	return c.JSON(geofenceBody{Geofence: toGeofenceDTO(g)})
+	return c.JSON(geofenceBody{Geofence: toGeofenceDTOPtr(g)})
 }
 
 // ---------------------------------------------------------------------------

@@ -230,7 +230,12 @@ func TestGeofencePut_AsDriver_403(t *testing.T) {
 // Get.
 // ---------------------------------------------------------------------------
 
-func TestGeofenceGet_NotFound_404(t *testing.T) {
+func TestGeofenceGet_NoFence_200Null(t *testing.T) {
+	// Unconfigured geofence is a normal state for a singleton
+	// sub-resource: the handler returns 200 with a JSON `null` in the
+	// envelope rather than 404. Keeps the SPA's DevTools clean and
+	// matches the REST semantic that "the fence resource exists with
+	// no current value" is not an error.
 	h := newGeofenceHarness(t)
 	mgrCookie := h.issueCookie(t, "mgr_001", "manager")
 	req := geoReq(t, http.MethodGet, "/api/vehicles/veh_unknown/geofence", nil, mgrCookie)
@@ -238,8 +243,12 @@ func TestGeofenceGet_NotFound_404(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Test: %v", err)
 	}
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404; body=%s", resp.StatusCode, readBody(t, resp))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, readBody(t, resp))
+	}
+	body := readBody(t, resp)
+	if !strings.Contains(body, `"geofence":null`) {
+		t.Errorf("body missing null geofence: %s", body)
 	}
 }
 
