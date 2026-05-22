@@ -39,6 +39,19 @@ export default defineNuxtConfig({
     preset: 'cloudflare_module',
   },
 
+  // Force-CSR for protected routes (auth-gated dashboard + driver report).
+  // WHY: under the cross-Worker gateway at fleet-tracker.jairukchan.com the SSR
+  // path to /api/auth/me does not forward the session cookie reliably, so the
+  // global auth middleware sees an anonymous request server-side and bounces to
+  // /login even when the browser holds a valid HttpOnly session. Client-side
+  // fetch uses the browser cookie jar and works. Trade-off: a brief blank flash
+  // before hydration on hard nav — acceptable for behind-login pages.
+  // Added 2026-05-22 — see agent-temp/repro-001-findings.md for the full repro.
+  routeRules: {
+    '/dashboard/**': { ssr: false },
+    '/driver/**': { ssr: false },
+  },
+
   runtimeConfig: {
     public: {
       // Populated from NUXT_PUBLIC_* env vars at runtime.
