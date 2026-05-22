@@ -49,7 +49,17 @@ export const useAuthStore = defineStore('auth', () => {
   async function logout(): Promise<void> {
     try {
       await api('/auth/logout', { method: 'POST' })
-    } finally {
+    }
+    catch {
+      // Logout 401 ("already logged out" — blocklisted JTI from a prior
+      // call, or expired session cookie) and other transport errors are
+      // benign here: the user clicked Sign out, we honor that intention
+      // by clearing local state below regardless of network outcome.
+      // Swallowing keeps the DevTools console clean (no unhandled
+      // FetchError rejection) and the UX consistent (user lands at
+      // /login regardless).
+    }
+    finally {
       // Always clear local state — even if the network call failed (eg
       // already-expired session), the user clicked Sign out and we must
       // reflect that intention in the UI.

@@ -17,9 +17,24 @@
 const auth = useAuthStore()
 const router = useRouter()
 
+// `signingOut` doubles as a click guard (prevents double-click → second
+// /auth/logout call with an already-blocklisted JTI → 401) and as the
+// flag that swaps the button label/spinner. Logout always settles
+// (auth.logout swallows network errors), so the finally clears the
+// flag in both the happy path and any unexpected throw from the
+// router.
+const signingOut = ref(false)
+
 async function signOut(): Promise<void> {
-  await auth.logout()
-  await router.push('/login')
+  if (signingOut.value) return
+  signingOut.value = true
+  try {
+    await auth.logout()
+    await router.push('/login')
+  }
+  finally {
+    signingOut.value = false
+  }
 }
 </script>
 
@@ -86,9 +101,29 @@ async function signOut(): Promise<void> {
               <Button
                 variant="outline"
                 size="sm"
+                :disabled="signingOut"
                 @click="signOut"
               >
-                Sign out
+                <span v-if="signingOut" class="inline-flex items-center gap-1.5">
+                  <svg
+                    class="h-3 w-3 animate-spin"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    aria-hidden="true"
+                  >
+                    <circle
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      stroke-width="3"
+                      stroke-linecap="round"
+                      stroke-dasharray="30 70"
+                    />
+                  </svg>
+                  Signing out…
+                </span>
+                <span v-else>Sign out</span>
               </Button>
             </template>
             <template v-else>

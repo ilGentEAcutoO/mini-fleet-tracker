@@ -15,6 +15,20 @@ const apiBase = useRuntimeConfig().public.apiBase
 type LandingState = 'checking' | 'logging-in' | 'show-marketing'
 const state = ref<LandingState>('checking')
 
+// Progressive splash status — rotating message every ~1.2s so the splash
+// reads as active progress instead of a static "loading" string. The
+// recruiter/viewer perceives momentum even though wall-clock is
+// dominated by the CF Container cold-start (~3-5s).
+const statusMessages = [
+  'Warming the backend container…',
+  'Authenticating session…',
+  'Loading fleet data…',
+  'Almost there…',
+]
+const statusIndex = ref(0)
+const statusMessage = computed(() => statusMessages[statusIndex.value])
+let statusTimer: ReturnType<typeof setInterval> | null = null
+
 // If already authenticated (e.g. browser remembers cookies from a prior visit),
 // jump straight to the dashboard. Client-only so SSR returns the landing for
 // SEO and the redirect happens during hydration.
@@ -25,12 +39,25 @@ const state = ref<LandingState>('checking')
 // ~5–10s cold-start). Only if loginAs fails do we drop down to the
 // marketing template so the user sees the buttons + error pill.
 //
-// We also fire a fire-and-forget GET /healthz in parallel with mount so
-// the CF Container starts warming concurrently with the auth check — this
-// shaves a few seconds off the perceived cold-start on a fresh visit.
+// Multi-prewarm: fire 3 GET /healthz requests in parallel with mount. CF
+// Container with max_instances=1 won't actually scale, but multiple
+// in-flight requests can help the scheduler complete the cold-start
+// sooner (and at worst is a few harmless extra round-trips). All
+// fire-and-forget so they overlap with the auth check.
 onMounted(async () => {
-  // Prewarm: don't await — this only exists to nudge the container awake.
-  fetch(`${apiBase}/healthz`).catch(() => {})
+  // Multi-prewarm: 3 parallel pings to nudge the container awake.
+  for (let i = 0; i < 3; i++) {
+    fetch(`${apiBase}/healthz`).catch(() => {})
+  }
+
+  // Rotate the splash message every 1.2s. Stops on success (page
+  // unmounts after router.push) or on the `show-marketing` transition
+  // via onBeforeUnmount cleanup below.
+  statusTimer = setInterval(() => {
+    if (statusIndex.value < statusMessages.length - 1) {
+      statusIndex.value += 1
+    }
+  }, 1200)
 
   if (!auth.fetched) await auth.fetchMe()
   if (auth.isAuthenticated) {
@@ -44,6 +71,13 @@ onMounted(async () => {
   // we want the user to see the marketing template with the error pill.
   if (errorMessage.value) {
     state.value = 'show-marketing'
+  }
+})
+
+onBeforeUnmount(() => {
+  if (statusTimer !== null) {
+    clearInterval(statusTimer)
+    statusTimer = null
   }
 })
 
@@ -69,9 +103,14 @@ watch(errorMessage, (msg) => {
       <h1 class="text-3xl font-semibold tracking-tight">
         Mini Fleet Tracker
       </h1>
-      <p class="text-muted-foreground">
-        Signing you in to the demo…
+      <p class="text-muted-foreground" aria-live="polite">
+        {{ statusMessage }}
       </p>
+      <div class="flex justify-center">
+        <div class="w-64 h-1 bg-muted rounded-full overflow-hidden">
+          <div class="splash-progress h-full bg-foreground origin-left" />
+        </div>
+      </div>
       <p class="text-xs text-muted-foreground">
         First-load warms the demo backend (~5–10s). Want a different role?
         <NuxtLink to="/login" class="underline">
@@ -151,3 +190,25 @@ watch(errorMessage, (msg) => {
     </div>
   </section>
 </template>
+
+<style scoped>
+/*
+ * Splash progress bar — fills over 5s on a single forward run. Pure
+ * aesthetics: the actual login may finish faster or slower; the bar
+ * provides a sense of progress so the wait reads as "moving" rather
+ * than "stuck". Scoped to this component so the keyframe doesn't
+ * leak into the global tailwind layer.
+ */
+@keyframes splash-progress {
+  0% {
+    transform: scaleX(0);
+  }
+  100% {
+    transform: scaleX(1);
+  }
+}
+
+.splash-progress {
+  animation: splash-progress 5s ease-out forwards;
+}
+</style>
