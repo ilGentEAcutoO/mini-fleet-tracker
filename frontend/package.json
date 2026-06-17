@@ -23,7 +23,7 @@
     "clsx": "^2.1.1",
     "lucide-vue-next": "^1.0.0",
     "maplibre-gl": "^5.24.0",
-    "nuxt": "^4.4.6",
+    "nuxt": "^4.4.7",
     "pinia": "^3.0.4",
     "reka-ui": "^2.9.7",
     "shadcn-nuxt": "^2.7.3",
