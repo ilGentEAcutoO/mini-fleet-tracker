@@ -1,0 +1,16 @@
+# Build scripts were never run under pnpm 10 (no onlyBuiltDependencies); keep that.
+allowBuilds:
+  esbuild: false
+  workerd: false
+# pnpm >= 10 reads overrides from here (pnpm 11 ignores package.json "pnpm.overrides").
+# Security pins for transitive dependencies — see Dependabot alerts.
+overrides:
+  postcss: '>=8.5.18'
+  sharp: '>=0.35.5'
+  undici: '>=8.10.2'
+  ws: '>=8.21.0'
+  esbuild: '>=0.28.1'
+  vite: '8.0.16'
+  vitest: '^4.1.11'
+  '@vitest/mocker': '^4.1.11'
+  source-map-js: '>=1.2.2'
