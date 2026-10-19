@@ -45,3 +45,5 @@ coverage/
 .claude/
 CLAUDE.md
 instruction/
+AGENTS.md
+.agents/
