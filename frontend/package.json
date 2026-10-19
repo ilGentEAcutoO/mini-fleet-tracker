@@ -22,7 +22,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-vue-next": "^1.0.0",
-    "maplibre-gl": "^5.24.0",
+    "maplibre-gl": "6.4.1",
     "nuxt": "^4.5.2",
     "pinia": "^3.0.4",
     "reka-ui": "^2.9.7",
@@ -40,6 +40,7 @@
   "devDependencies": {
     "@nuxt/eslint": "^1.15.2",
     "@nuxt/eslint-config": "^1.15.2",
+    "@types/geojson": "^7946.0.16",
     "@types/node": "^22.10.5",
     "eslint": "^10.4.0",
     "prettier": "^3.8.3",

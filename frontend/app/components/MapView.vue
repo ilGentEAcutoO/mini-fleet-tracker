@@ -19,7 +19,8 @@
 // Updates set new data on the source (no layer rebuild) — same flicker-
 // free reasoning as the markers.
 import type { Position } from '~~/shared/types/domain'
-import type { Map as MlMap, Marker as MlMarker } from 'maplibre-gl'
+import type { GeoJSONSource, Map as MlMap, Marker as MlMarker } from 'maplibre-gl'
+import type { Feature, LineString } from 'geojson'
 
 interface Props {
   // vehicle_id → latest position. A Map (not a plain object) so consumers
@@ -192,7 +193,7 @@ function syncPath() {
     return
   }
 
-  const geojson: GeoJSON.Feature<GeoJSON.LineString> = {
+  const geojson: Feature<LineString> = {
     type: 'Feature',
     geometry: {
       type: 'LineString',
@@ -202,7 +203,7 @@ function syncPath() {
   }
 
   if (sourceExists) {
-    const src = m.getSource(PATH_SOURCE_ID) as maplibregl.GeoJSONSource
+    const src = m.getSource(PATH_SOURCE_ID) as GeoJSONSource
     src.setData(geojson)
     return
   }

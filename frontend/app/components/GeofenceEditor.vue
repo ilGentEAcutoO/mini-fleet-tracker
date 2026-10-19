@@ -36,7 +36,7 @@
 //   returns 400 if these are violated. We surface the client message
 //   directly to avoid a network round-trip for obvious typos.
 import { toast } from 'vue-sonner'
-import type { Map as MlMap } from 'maplibre-gl'
+import type { GeoJSONSource, Map as MlMap } from 'maplibre-gl'
 import type { Geofence } from '~~/shared/types/domain'
 
 interface Props {
@@ -189,7 +189,7 @@ function syncCircle(): void {
   )
 
   if (m.getSource(FENCE_SOURCE_ID)) {
-    const src = m.getSource(FENCE_SOURCE_ID) as maplibregl.GeoJSONSource
+    const src = m.getSource(FENCE_SOURCE_ID) as GeoJSONSource
     src.setData(polygon)
     return
   }

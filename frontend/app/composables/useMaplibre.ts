@@ -10,7 +10,8 @@
 // for free on Cloudflare's edge, no API key, attribution baked into the
 // style JSON. The style URL can be overridden via NUXT_PUBLIC_MAP_STYLE
 // for projects that want to point at their own tile server.
-import maplibregl from 'maplibre-gl'
+import * as maplibregl from 'maplibre-gl'
+import type { Feature, Polygon } from 'geojson'
 import 'maplibre-gl/dist/maplibre-gl.css'
 
 export interface MaplibreHandle {
@@ -35,7 +36,7 @@ export function circlePolygon(
   center: { lat: number; lng: number },
   radiusMeters: number,
   points = 64,
-): GeoJSON.Feature<GeoJSON.Polygon> {
+): Feature<Polygon> {
   const coords: [number, number][] = []
   const radLat = (center.lat * Math.PI) / 180
   // 1 deg lat = 111_320 m; longitude shrinks by cos(lat) toward the poles.
